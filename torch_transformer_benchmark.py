@@ -172,32 +172,149 @@ class BaselineTransformer(nn.Module):
         return x
 
 
+def _get_fused_qkv_weights(attn: "BaselineSelfAttention") -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lazily fuse an attention module's q/k/v projection weight+bias into a
+    single packed [3*d_model, d_model] weight and [3*d_model] bias, so that
+    one GEMM (F.linear) can replace three separate ones.
+
+    The packed tensors are cached as a plain (non-parameter, non-buffer)
+    attribute on the attention module and rebuilt only if the source
+    parameters' storage/dtype/device change (e.g. after copy_model_weights
+    followed by .to(device, dtype), which happens once before the first
+    forward call). This keeps state_dict()/load_state_dict() untouched:
+    no new nn.Parameter or persistent buffer is registered.
+    """
+    q_w, k_w, v_w = attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight
+    q_b, k_b, v_b = attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias
+
+    cache_key = (
+        q_w.data_ptr(), k_w.data_ptr(), v_w.data_ptr(),
+        q_b.data_ptr(), k_b.data_ptr(), v_b.data_ptr(),
+        q_w.dtype, q_w.device,
+    )
+    cached = getattr(attn, "_fused_qkv_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1], cached[2]
+
+    fused_weight = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
+    fused_bias = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
+    attn._fused_qkv_cache = (cache_key, fused_weight, fused_bias)
+    return fused_weight, fused_bias
+
+
 class UserOptimizedTransformer(BaselineTransformer):
     """
-    Replace this class with the optimized implementation.
+    Eager-mode optimized implementation of BaselineTransformer.
 
-    Requirements:
-      1. Keep the forward signature unchanged.
-      2. Return a tensor with shape [batch_size, seq_len, d_model].
-      3. Keep compatible parameter names, or customize copy_model_weights().
+    Optimizations applied (structural, no torch.compile / CUDA graphs /
+    dtype changes / custom kernels):
+      1. Fused QKV projection: q_proj/k_proj/v_proj weights+biases are
+         packed into one [3*d_model, d_model] matrix per layer so a single
+         GEMM replaces three. out_proj and the FFN GEMMs stay separate.
+      2. F.scaled_dot_product_attention replaces the manual
+         matmul + fp32-softmax + matmul, letting a fused SDPA backend
+         (flash / mem-efficient / math) run instead of several kernels.
+      3. Mask fast-path: when valid_token_mask is None or all tokens are
+         valid, no masked_fill / mask tensor is built anywhere, and the
+         causal case uses SDPA's is_causal=True fast path (no explicit
+         attn_mask materialized at all). The all-True check is done once
+         per forward call (one sync), not once per layer.
+      4. The causal "allowed" mask is cached per (seq_len, device) instead
+         of being rebuilt with torch.ones(...).triu() on every layer/call;
+         it is only needed at all when both causal and padding are active
+         simultaneously (otherwise is_causal=True is used with no mask
+         tensor whatsoever).
+      5. view/transpose (no .contiguous()) feed directly into SDPA, and the
+         post-attention merge uses .reshape() so a copy only happens if the
+         layout actually requires one.
+
+    Parameter names/shapes are identical to BaselineTransformer (this class
+    adds no new nn.Parameter/buffer), so copy_model_weights()'s strict
+    load_state_dict() works unchanged. All fused/cached tensors are built
+    lazily on first forward, since weight copying happens before the model
+    is moved to its final device/dtype.
     """
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config)
+        # (seq_len, device) -> bool [S, S] tensor, True where a query
+        # position may attend to a key position (causal-allowed).
+        self._causal_allowed_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+
+    def _get_causal_allowed(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        key = (seq_len, device)
+        cached = self._causal_allowed_cache.get(key)
+        if cached is not None:
+            return cached
+        allowed = torch.tril(
+            torch.ones((seq_len, seq_len), device=device, dtype=torch.bool)
+        )
+        self._causal_allowed_cache[key] = allowed
+        return allowed
 
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # ====================== your codes here ======================
-        # Example optimization directions:
-        #   * torch.nn.functional.scaled_dot_product_attention
-        #   * torch.compile
-        #   * Triton/CUDA fused kernels
-        #   * fused LayerNorm / residual / FFN
-        #
-        # The default implementation calls the baseline so that this script
-        # remains directly runnable before the optimized code is inserted.
-        return super().forward(x, valid_token_mask)
-        # ============================================================
+        batch, seq_len, d_model = x.shape
+        causal = self.config.causal
+
+        # ---- fast-path mask detection: at most one sync per forward ----
+        mask_active = False
+        invalid_mask: Optional[torch.Tensor] = None
+        if valid_token_mask is not None:
+            if not bool(torch.all(valid_token_mask)):
+                mask_active = True
+                invalid_mask = ~valid_token_mask[..., None]  # [B, S, 1]
+
+        # ---- decide the SDPA attn_mask / is_causal path once per call ----
+        is_causal = False
+        attn_mask: Optional[torch.Tensor] = None
+        if causal and not mask_active:
+            # Pure causal, no padding: let SDPA's fused causal kernel run,
+            # no mask tensor is ever materialized.
+            is_causal = True
+        elif causal and mask_active:
+            allowed = self._get_causal_allowed(seq_len, x.device)  # [S, S], cached
+            key_valid = valid_token_mask[:, None, None, :]  # [B, 1, 1, S]
+            attn_mask = allowed[None, None, :, :] & key_valid  # [B, 1, S, S]
+        elif mask_active:
+            attn_mask = valid_token_mask[:, None, None, :]  # [B, 1, 1, S]
+
+        for layer in self.layers:
+            attn = layer.attention
+            normed = layer.norm1(x)
+
+            fused_weight, fused_bias = _get_fused_qkv_weights(attn)
+            qkv = F.linear(normed, fused_weight, fused_bias)
+            q, k, v = qkv.split(d_model, dim=-1)
+
+            q = q.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+            k = k.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+            v = v.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+
+            context = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                scale=attn.scale,
+            )
+            context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
+            attn_out = attn.out_proj(context)
+            if mask_active:
+                attn_out = attn_out.masked_fill(invalid_mask, 0)
+
+            x = x + attn_out
+            x = x + layer.ffn_out(F.gelu(layer.ffn_in(layer.norm2(x)), approximate="none"))
+
+            if mask_active:
+                x = x.masked_fill(invalid_mask, 0)
+
+        x = self.final_norm(x)
+        if mask_active:
+            x = x.masked_fill(invalid_mask, 0)
+        return x
 
 
 def copy_model_weights(
