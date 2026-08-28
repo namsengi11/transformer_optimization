@@ -125,6 +125,9 @@ def main() -> int:
                     help="also wrap the user model in torch.compile externally")
     ap.add_argument("--skip-speed-bar", action="store_true",
                     help="skip the compiled-baseline run (correctness only)")
+    ap.add_argument("--bar-reps", type=int, default=2,
+                    help="runs of the compiled baseline; the fastest is used "
+                         "as the bar (conservative)")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--case", action="append", default=None,
                     help="run only these case names")
@@ -145,9 +148,18 @@ def main() -> int:
 
         bar = None
         if not args.skip_speed_bar:
-            print(f"[run_bench] {name} (speed bar: compiled baseline) ...", flush=True)
-            bar_run = run_case(name, extra, True, args.compile_user, args.timeout)
-            bar = bar_run.get("baseline_ms")
+            # The compiled baseline has ~30% run-to-run variance across processes
+            # (observed: padded_fp16 bar 2.03 ms vs 1.53 ms on identical code).
+            # Take the FASTEST bar over `--bar-reps` runs, which is the
+            # conservative choice: it makes our reported speedup a lower bound.
+            bars = []
+            for rep in range(args.bar_reps):
+                print(f"[run_bench] {name} (speed bar: compiled baseline, "
+                      f"rep {rep + 1}/{args.bar_reps}) ...", flush=True)
+                bar_run = run_case(name, extra, True, args.compile_user, args.timeout)
+                if bar_run.get("baseline_ms"):
+                    bars.append(bar_run["baseline_ms"])
+            bar = min(bars) if bars else None
 
         opt_ms = acc_run.get("optimized_ms")
         r = {
