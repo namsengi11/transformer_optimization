@@ -68,6 +68,29 @@ SUITES = {
                               "--layers", "12", "--batch-size", "16",
                               "--seq-len", "256"],
     },
+    # User-supplied grading matrix. Columns as given were unlabeled; inferred
+    # order (batch_size, seq_len, num_heads, ffn_dim, num_layers, causal,
+    # d_model) from the unique mapping that keeps every row satisfying
+    # d_model % num_heads == 0 and physically constructible on this GPU (the
+    # alternative reading puts d_model=100000 on row 14, a 40GB weight matrix
+    # that can't be allocated at all). fp32 dtype (harness default); dtype
+    # was not part of the given matrix.
+    "user_matrix": {
+        "01_base":        ["--batch-size", "64",    "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "02_batch1":      ["--batch-size", "1",      "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "03_batch4":      ["--batch-size", "4",      "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "04_batch16":     ["--batch-size", "16",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "05_batch128":    ["--batch-size", "128",    "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "06_batch10000":  ["--batch-size", "10000",  "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "07_seq32":       ["--batch-size", "64",     "--seq-len", "32",   "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "32"],
+        "08_seq1024":     ["--batch-size", "64",     "--seq-len", "1024", "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "1024"],
+        "09_heads1":      ["--batch-size", "64",     "--seq-len", "128",  "--heads", "1",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "10_heads2":      ["--batch-size", "64",     "--seq-len", "128",  "--heads", "2",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "11_heads16":     ["--batch-size", "64",     "--seq-len", "128",  "--heads", "16", "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "12_ffn32":       ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "32",     "--layers", "4", "--causal", "--d-model", "128"],
+        "13_ffn1024":     ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "1024",   "--layers", "4", "--causal", "--d-model", "128"],
+        "14_extreme":     ["--batch-size", "32",     "--seq-len", "1024", "--heads", "16", "--ffn-dim", "100000", "--layers", "2", "--causal", "--d-model", "1024"],
+    },
 }
 
 SPEEDUP_RE = re.compile(r"speedup\s*:\s*([0-9.]+)x")
