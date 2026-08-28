@@ -185,6 +185,93 @@ class BaselineTransformer(nn.Module):
         return x
 
 
+class ChunkedBaselineTransformerBlock(BaselineTransformerBlock):
+    """BaselineTransformerBlock with the FFN sub-step computed in row-chunks
+    along the flattened (batch*seq) dimension, to bound peak memory for very
+    large ffn_dim configs (e.g. ffn_dim=100000 materializes a
+    [batch, seq, ffn_dim] GELU intermediate that does not fit in 16GB at
+    batch=32/seq=1024 in one shot).
+
+    In exact (real-number) arithmetic this changes nothing: LayerNorm/GELU/
+    the two FFN Linears are all strictly row-wise (no cross-token mixing,
+    unlike attention), so slicing the input into row-chunks, running each
+    through ffn_in -> gelu -> ffn_out, and concatenating the results is the
+    same computation as running it in one shot. In FLOATING-POINT arithmetic
+    it is NOT automatically bit-exact, though: cuBLAS can select a different
+    GEMM kernel/reduction order depending on the row (M) count, exactly the
+    class of bug this codebase already hit once for softmax (see
+    _fused_attn_probs's docstring on the dtype=torch.float32 divergence at
+    long sequences). Measured directly: at d_model=512/ffn_dim=2048, chunk
+    sizes 256/512 are bit-exact but 64/128 are not (max_abs ~6e-4); at
+    d_model=1024/ffn_dim=100000 (this class's actual motivating shape),
+    128 through 4096 are all bit-exact but 64 is not (max_abs ~2.6e-4).
+    The relationship is NOT a simple "big enough is safe" threshold -- a
+    d_model=1024/ffn_dim=8192 sweep found 128 exact, then 256/512/1024/
+    2048/4096 all INexact (~3-4e-4), then 8192+ exact again. So the default
+    below (4096) is an empirically-checked-for-these-shapes choice, not a
+    proven-safe-in-general one: verify bit-exactness against
+    BaselineTransformer at a feasible reduced-size shape (same d_model and
+    ffn_dim, smaller batch/seq) before trusting a new (d_model, ffn_dim,
+    chunk_size) combination, the same way this one was checked.
+
+    Reuses norm1/attention/norm2/ffn_in/ffn_out from BaselineTransformerBlock
+    unchanged (no new parameters), so state_dict() keys and copy_model_weights
+    are unaffected.
+    """
+
+    def __init__(
+        self, d_model: int, num_heads: int, ffn_dim: int, ffn_chunk_size: int = 4096
+    ) -> None:
+        super().__init__(d_model, num_heads, ffn_dim)
+        if ffn_chunk_size <= 0:
+            raise ValueError("ffn_chunk_size must be positive")
+        self.ffn_chunk_size = ffn_chunk_size
+
+    def _chunked_ffn(self, h: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, d_model = h.shape
+        flat = h.reshape(batch * seq_len, d_model)
+        chunks = []
+        for start in range(0, flat.shape[0], self.ffn_chunk_size):
+            piece = flat[start : start + self.ffn_chunk_size]
+            chunks.append(
+                self.ffn_out(F.gelu(self.ffn_in(piece), approximate="none"))
+            )
+        return torch.cat(chunks, dim=0).reshape(batch, seq_len, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x), valid_token_mask, causal)
+        x = x + self._chunked_ffn(self.norm2(x))
+
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+
+class ChunkedBaselineTransformer(BaselineTransformer):
+    """BaselineTransformer with every block's FFN computed in row-chunks.
+    Identical parameters/state_dict keys to BaselineTransformer; only used
+    when explicitly requested (--chunk-baseline-ffn), never by default, so
+    every existing measurement against the plain BaselineTransformer is
+    unaffected by this class's existence.
+    """
+
+    def __init__(self, config: TransformerConfig, ffn_chunk_size: int = 4096) -> None:
+        super().__init__(config)
+        self.layers = nn.ModuleList(
+            [
+                ChunkedBaselineTransformerBlock(
+                    config.d_model, config.num_heads, config.ffn_dim, ffn_chunk_size
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+
+
 def _get_fused_qkv_weights(attn: "BaselineSelfAttention") -> Tuple[torch.Tensor, torch.Tensor]:
     """Lazily fuse an attention module's q/k/v projection weight+bias into a
     single packed [3*d_model, d_model] weight and [3*d_model] bias, so that
@@ -317,10 +404,13 @@ if _TRITON_AVAILABLE:
         raw [B, H, Sq, Sk] QK^T score tensor -- the scale multiply and the
         (up to two) masked_fills -- into a single kernel that reads the raw
         scores once and writes the scaled+masked scores once, in the model
-        dtype. The fp32 softmax itself is deliberately left to
-        `torch.softmax(..., dtype=torch.float32)` (called by
-        _fused_attn_probs right after this kernel) rather than also being
-        fused in here.
+        dtype. The softmax itself is deliberately left to ATen's native
+        `torch.softmax(scaled, dim=-1)` (called by _fused_attn_probs right
+        after this kernel, directly on the half/bfloat16 output of this
+        kernel -- no dtype= kwarg, no explicit .float() upcast; ATen's CUDA
+        softmax already accumulates in fp32 internally and is bit-identical
+        to an explicit-upcast reference, see _fused_attn_probs's docstring)
+        rather than also being fused in here.
 
         That split is load-bearing, not an oversight: an earlier version of
         this kernel *did* fuse the softmax reduction too (single Triton
@@ -471,14 +561,19 @@ class UserOptimizedTransformer(BaselineTransformer):
              ".float()" softmax upcast is a no-op in fp32, so SDPA's math
              (which scales q before the matmul and keeps higher-precision
              probs internally) still matches the baseline within tolerance.
-           - fp16 / bf16: the manual matmul + fp32-softmax + matmul,
-             replicated bit-for-bit against BaselineSelfAttention (scale
-             applied *after* q@k^T, masks applied with the same
-             masked_fill(..., -inf) calls in the same order, softmax done
-             in fp32 and cast back). SDPA's internal math diverges from
-             this by more than atol/rtol once compounded over several
-             layers at fp16/bf16 precision, so it is only used where it is
-             provably equivalent (fp32).
+           - fp16 / bf16: the manual matmul + softmax + matmul, replicated
+             bit-for-bit against BaselineSelfAttention (scale applied
+             *after* q@k^T, masks applied with the same masked_fill(...,
+             -inf) calls in the same order, softmax run natively on the
+             half/bfloat16 scores with no dtype= kwarg and no explicit
+             .float() upcast -- see _fused_attn_probs's docstring for why
+             that is bit-identical to the baseline's explicit-upcast form
+             while also avoiding a dtype=torch.float32-kwarg kernel-
+             selection bug that diverged from the baseline at long sequence
+             lengths). SDPA's internal math diverges from this by more than
+             atol/rtol once compounded over several layers at fp16/bf16
+             precision, so it is only used where it is provably equivalent
+             (fp32).
       3. Mask fast-path: when valid_token_mask is None or all tokens are
          valid, no masked_fill / mask tensor is built anywhere, and the
          causal case (fp32 path) uses SDPA's is_causal=True fast path (no
@@ -541,27 +636,30 @@ class UserOptimizedTransformer(BaselineTransformer):
          selected.
       8. Fused scale+mask Triton kernel, fp16/bf16 only: on the manual-math
          branch from item 2, the raw (unscaled) Q@K^T matmul still runs as
-         one ATen GEMM, and the fp32 softmax still runs as ATen's own
-         `torch.softmax(..., dtype=torch.float32)`, but the scale multiply
-         and the (up to two) combined masked_fills that sit between them are
-         fused into a single Triton kernel (_fused_scale_mask_kernel,
-         launched via _fused_attn_probs/_triton_fused_scale_mask) that reads
-         the raw scores once and writes the scaled+masked scores once,
-         autotuned per sequence length (BLOCK_N, num_warps) via
-         @triton.autotune. This is a purely elementwise fusion (no
-         reduction), verified bit-exact (torch.equal, not just close)
-         against `(scores * scale).masked_fill(combined_mask, -inf)` --
-         deliberately NOT also fusing the softmax reduction itself: an
-         earlier version that did was only ever ~1e-4 to 1e-5 max_abs away
-         from ATen's softmax per call (ordinary reduction-order/exp-eval
-         noise between two different implementations), but fp16/bf16 has no
-         headroom to absorb that -- compounded across the default 6-layer
-         stack it grew into a full fp16-ulp divergence and real accuracy
-         FAILures, so the softmax reduction itself stays on ATen's
-         (bit-exact) kernel. Falls back to an equivalent ATen chain (also
-         bit-exact with BaselineSelfAttention, using a single combined mask
-         and `torch.softmax(..., dtype=torch.float32)` in place of an
-         explicit `.float()` upcast) if Triton is unavailable, off-CUDA, or
+         one ATen GEMM, and the softmax still runs as ATen's own native
+         `torch.softmax(scaled, dim=-1)` (no dtype= kwarg, no explicit
+         `.float()` upcast -- see _fused_attn_probs's docstring for why that
+         is bit-identical to the baseline's explicit-upcast softmax, cheaper
+         (no fp32 intermediate), AND -- unlike the dtype=torch.float32-kwarg
+         form this used to use -- doesn't diverge from the baseline at long
+         sequence lengths), but the scale multiply and the (up to two)
+         combined masked_fills that sit between them are fused into a single
+         Triton kernel (_fused_scale_mask_kernel, launched via
+         _fused_attn_probs/_triton_fused_scale_mask) that reads the raw
+         scores once and writes the scaled+masked scores once, autotuned per
+         sequence length (BLOCK_N, num_warps) via @triton.autotune. This is a
+         purely elementwise fusion (no reduction), verified bit-exact
+         (torch.equal, not just close) against `(scores *
+         scale).masked_fill(combined_mask, -inf)` -- deliberately NOT also
+         fusing the softmax reduction itself: an earlier version that did
+         was only ever ~1e-4 to 1e-5 max_abs away from ATen's softmax per
+         call (ordinary reduction-order/exp-eval noise between two different
+         implementations), but fp16/bf16 has no headroom to absorb that --
+         compounded across the default 6-layer stack it grew into a full
+         fp16-ulp divergence and real accuracy FAILures, so the softmax
+         reduction itself stays on ATen's (bit-exact) kernel. Falls back to
+         an equivalent ATen chain (also bit-exact with BaselineSelfAttention,
+         using a single combined mask) if Triton is unavailable, off-CUDA, or
          a launch raises; a failure permanently disables the Triton path for
          that model instance (see `_triton_softmax_disabled`), so it can
          never be attempted for the first time from inside a CUDA graph
@@ -914,18 +1012,39 @@ class UserOptimizedTransformer(BaselineTransformer):
         fused Triton scale+mask kernel first (_triton_fused_scale_mask: one
         read of scores_raw, one write of the scaled+masked scores, replacing
         2-3 separate ATen kernels each touching the [B,H,S,S] score tensor),
-        then finishes with ATen's own `torch.softmax(..., dim=-1,
-        dtype=torch.float32)` -- kept on ATen deliberately, not also fused,
-        because a from-scratch Triton softmax reduction was verified to only
-        be ~1e-4 to 1e-5 max_abs from ATen's per call, which sounds tiny but
-        compounds past the harness's atol across a 6-layer stack at
-        fp16/bf16 (see the kernel docstring for the measured numbers). The
-        ATen fallback chain used when Triton isn't used at all is itself
+        then finishes with a *native* `torch.softmax(scaled, dim=-1)` call --
+        i.e. no dtype= kwarg and no explicit `.float()` upcast at all, run
+        directly on the half/bfloat16 `scaled` tensor. This is NOT an
+        approximation: ATen's CUDA softmax already accumulates in fp32
+        internally and rounds once at the end, so this call is BIT-IDENTICAL
+        to `torch.softmax(scaled.float(), dim=-1).to(dtype)` -- verified with
+        torch.equal across (8,8,128,128), (4,8,2048,2048), (32,8,512,512),
+        (8,16,256,256) and (8,4,4096,4096) in both fp16 and bf16, all
+        max_abs=0. It is also strictly cheaper: no fp32 intermediate is ever
+        materialized (at B=4/S=2048 fp16 that intermediate would be 512 MB,
+        written and read back), so this removes ~1 read+write pass over the
+        [B,H,S,S] score tensor versus the old dtype=torch.float32 form.
+
+        That old form -- `torch.softmax(scaled, dim=-1, dtype=torch.float32)`
+        -- looks equivalent but is NOT: passing dtype= makes ATen select a
+        different reduction kernel than an explicit `.float()` cast followed
+        by a plain softmax, and at long rows (verified: S=2048 and S=4096 in
+        fp16; not observed at S<=512 fp16 or at any bf16 shape tried) that
+        different kernel picks a different reduction order and diverges from
+        `scores.float().softmax(...)` by a few ulps (measured up to
+        max_abs=0.00048828 alone, compounding across a 6-layer stack into a
+        real accuracy FAIL). That was the actual cause of the long_fp16
+        accuracy failure this method used to have -- not a contiguity issue
+        (matmul was verified contiguity-invariant on this cuBLAS build) but a
+        genuinely different ATen softmax code path selected purely by
+        row-length. The native no-cast form used below sidesteps that
+        entirely, and was checked bit-exact at exactly the shapes that broke
+        the dtype= form.
+
+        The ATen fallback chain used when Triton isn't used at all is itself
         bit-exact with BaselineSelfAttention -- a single combined mask
-        instead of two successive masked_fills, and
-        `torch.softmax(s, dim=-1, dtype=torch.float32)` in place of an
-        explicit `.float()` upcast, both verified bit-exact against the
-        original two-call form -- so accuracy is identical whichever path
+        instead of two successive masked_fills, verified bit-exact against
+        the original two-call form -- so accuracy is identical whichever path
         runs; only the number of kernel launches/memory touches differs.
 
         A Triton launch failure permanently disables the Triton path for
@@ -953,7 +1072,67 @@ class UserOptimizedTransformer(BaselineTransformer):
             if disallowed is not None:
                 scaled = scaled.masked_fill(disallowed, float("-inf"))
 
-        return torch.softmax(scaled, dim=-1, dtype=torch.float32).to(dtype=out_dtype)
+        # Native softmax on the already-model-dtype `scaled` tensor: no
+        # dtype= kwarg, no explicit .float() upcast. Bit-identical to the
+        # baseline's `softmax(scores.float(), dim=-1).to(dtype)` (ATen's CUDA
+        # softmax accumulates in fp32 internally regardless), and avoids both
+        # the fp32 intermediate AND the dtype=-kwarg kernel-selection bug
+        # that caused divergence at long sequence lengths. See docstring.
+        assert scaled.dtype == out_dtype
+        return torch.softmax(scaled, dim=-1)
+
+    # Row-count threshold (estimated fp32 GELU-intermediate bytes) above which
+    # _forward_core switches to a row-chunked FFN instead of materializing
+    # [batch*seq_len, ffn_dim] in one shot. 3GB is comfortably above every
+    # shape in this codebase's own test suites (largest: wide_fp16 at
+    # 4096*4096*4 = 67MB) so it never triggers for anything already
+    # validated -- only for configs like ffn_dim=100000 at batch=32/seq=1024
+    # (12.2GB unchunked) that would OOM a 16GB GPU otherwise. See
+    # ChunkedBaselineTransformerBlock's docstring: chunk size is NOT
+    # automatically bit-exact in floating point (cuBLAS kernel selection can
+    # depend on row count), so 4096 is used because it was measured bit-exact
+    # against the unchunked computation at this codebase's actual large-ffn_dim
+    # shape (d_model=1024, ffn_dim=100000), not assumed safe in general.
+    _FFN_CHUNK_THRESHOLD_BYTES = 3 * 1024**3
+    _FFN_CHUNK_SIZE = 4096
+
+    def _ffn_chunk_size(self, batch: int, seq_len: int, ffn_dim: int) -> Optional[int]:
+        total_rows = batch * seq_len
+        estimated_bytes = total_rows * ffn_dim * 4
+        if estimated_bytes <= self._FFN_CHUNK_THRESHOLD_BYTES:
+            return None
+        return min(self._FFN_CHUNK_SIZE, total_rows)
+
+    @staticmethod
+    def _chunked_ffn_fp32(
+        normed2: torch.Tensor, ffn_in: nn.Linear, ffn_out: nn.Linear, chunk_size: int
+    ) -> torch.Tensor:
+        batch, seq_len, d_model = normed2.shape
+        flat = normed2.reshape(batch * seq_len, d_model)
+        pieces = [
+            ffn_out(F.gelu(ffn_in(flat[start : start + chunk_size]), approximate="none"))
+            for start in range(0, flat.shape[0], chunk_size)
+        ]
+        return torch.cat(pieces, dim=0).reshape(batch, seq_len, d_model)
+
+    @staticmethod
+    def _chunked_ffn_fp16gemm(
+        normed2: torch.Tensor,
+        ffn_in_weight16: torch.Tensor,
+        ffn_in_bias16: torch.Tensor,
+        ffn_out_weight16: torch.Tensor,
+        ffn_out_bias16: torch.Tensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        batch, seq_len, d_model = normed2.shape
+        flat = normed2.reshape(batch * seq_len, d_model)
+        pieces = []
+        for start in range(0, flat.shape[0], chunk_size):
+            piece = flat[start : start + chunk_size]
+            hidden = F.linear(piece.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
+            hidden = F.gelu(hidden, approximate="none")
+            pieces.append(F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32))
+        return torch.cat(pieces, dim=0).reshape(batch, seq_len, d_model)
 
     def _forward_core(
         self,
@@ -1041,10 +1220,16 @@ class UserOptimizedTransformer(BaselineTransformer):
 
                 normed2 = layer.norm2(x)
                 ffn_in_weight16, ffn_in_bias16 = _get_linear_fp16_weights(layer.ffn_in)
-                hidden = F.linear(normed2.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
-                hidden = F.gelu(hidden, approximate="none")
                 ffn_out_weight16, ffn_out_bias16 = _get_linear_fp16_weights(layer.ffn_out)
-                ffn_out = F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32)
+                chunk_size = self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim)
+                if chunk_size is None:
+                    hidden = F.linear(normed2.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
+                    hidden = F.gelu(hidden, approximate="none")
+                    ffn_out = F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32)
+                else:
+                    ffn_out = self._chunked_ffn_fp16gemm(
+                        normed2, ffn_in_weight16, ffn_in_bias16, ffn_out_weight16, ffn_out_bias16, chunk_size
+                    )
                 x = x + ffn_out
 
                 if mask_active:
@@ -1103,7 +1288,12 @@ class UserOptimizedTransformer(BaselineTransformer):
                 attn_out = attn_out.masked_fill(invalid_mask, 0)
 
             x = x + attn_out
-            x = x + layer.ffn_out(F.gelu(layer.ffn_in(layer.norm2(x)), approximate="none"))
+            normed2 = layer.norm2(x)
+            chunk_size = self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim)
+            if chunk_size is None:
+                x = x + layer.ffn_out(F.gelu(layer.ffn_in(normed2), approximate="none"))
+            else:
+                x = x + self._chunked_ffn_fp32(normed2, layer.ffn_in, layer.ffn_out, chunk_size)
 
             if mask_active:
                 x = x.masked_fill(invalid_mask, 0)
@@ -1547,6 +1737,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--non-strict-weight-copy", action="store_true")
     parser.add_argument(
+        "--chunk-baseline-ffn",
+        action="store_true",
+        help=(
+            "use ChunkedBaselineTransformer instead of BaselineTransformer: "
+            "identical computation, FFN done in row-chunks to bound peak "
+            "memory for very large ffn_dim configs. Off by default; does "
+            "not affect BaselineTransformer or any existing measurement."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-ffn-chunk-size",
+        type=int,
+        default=4096,
+        help="row-chunk size for --chunk-baseline-ffn (rows = batch*seq_len)",
+    )
+    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -1601,7 +1807,12 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
-    baseline = BaselineTransformer(config)
+    if args.chunk_baseline_ffn:
+        baseline = ChunkedBaselineTransformer(
+            config, ffn_chunk_size=args.baseline_ffn_chunk_size
+        )
+    else:
+        baseline = BaselineTransformer(config)
     optimized = UserOptimizedTransformer(config)
     copy_model_weights(
         baseline,
