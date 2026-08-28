@@ -16,7 +16,9 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import os
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -202,6 +204,78 @@ def _get_fused_qkv_weights(attn: "BaselineSelfAttention") -> Tuple[torch.Tensor,
     return fused_weight, fused_bias
 
 
+def _get_linear_fp16_weights(linear: nn.Linear) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lazily cache fp16 copies of an nn.Linear's weight+bias, used only by
+    UserOptimizedTransformer's fp32-model fp16-GEMM path (see
+    _forward_core's use_fp16_gemm branch). Cached as a plain (non-parameter,
+    non-buffer) attribute on the Linear module itself -- the same strategy
+    _get_fused_qkv_weights uses -- so weights are cast to fp16 once and
+    rebuilt only if the source weight/bias identity, dtype, or device
+    changes, never every forward call."""
+    w, b = linear.weight, linear.bias
+    cache_key = (w.data_ptr(), w.dtype, w.device, b.data_ptr(), b.dtype, b.device)
+    cached = getattr(linear, "_fp16_gemm_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1], cached[2]
+    w16 = w.to(torch.float16).contiguous()
+    b16 = b.to(torch.float16).contiguous()
+    linear._fp16_gemm_cache = (cache_key, w16, b16)
+    return w16, b16
+
+
+def _get_fused_qkv_weights_fp16(attn: "BaselineSelfAttention") -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp16 copy of the fused QKV weight/bias produced by
+    _get_fused_qkv_weights, used only by the fp32 model's fp16-GEMM path.
+    Cached separately from (but keyed off the identity of) the fp32 fused
+    tensors, so it is rebuilt exactly when those are rebuilt -- and, like
+    _get_fused_qkv_weights itself, costs nothing beyond the first forward
+    call for a given set of source weights."""
+    fused_weight, fused_bias = _get_fused_qkv_weights(attn)
+    cache_key = (fused_weight.data_ptr(), fused_bias.data_ptr())
+    cached = getattr(attn, "_fused_qkv_fp16_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1], cached[2]
+    w16 = fused_weight.to(torch.float16).contiguous()
+    b16 = fused_bias.to(torch.float16).contiguous()
+    attn._fused_qkv_fp16_cache = (cache_key, w16, b16)
+    return w16, b16
+
+
+def _fp16_gemm_gate_thresholds() -> Tuple[float, float]:
+    """Base (atol, rtol) that the fp16-GEMM calibration gate scales its
+    safety margin from. Overridable via TJ_ATOL / TJ_RTOL so the gate can be
+    tightened without a code change; defaults match the harness's own
+    correctness criterion (see module docstring)."""
+    atol = float(os.environ.get("TJ_ATOL", "0.002"))
+    rtol = float(os.environ.get("TJ_RTOL", "0.02"))
+    return atol, rtol
+
+
+# Fraction of (atol, rtol) the calibration gate requires -- with ZERO
+# elements failing, not just "on average" -- before trusting the fp16-GEMM
+# path for a configuration. Chosen empirically (see torch_transformer_
+# benchmark.py PR notes) by sweeping both --input-scale and several distinct
+# shapes and comparing the fp16-GEMM candidate against the existing fp32
+# path at each candidate margin:
+#   - margin=1.0 (the harness's raw atol=0.002/rtol=2%) sits exactly ON the
+#     pass/fail line: --input-scale 0.5 already has 0 failing elements at
+#     margin=1.0, which would wrongly ENABLE the path for an input scale
+#     that must be rejected -- no safety margin at all.
+#   - margin<=0.8 is too strict the other way: at the wide/deep shape
+#     (d_model=1024, 16 heads, ffn=4096, 12 layers) the deeper stack alone
+#     (no scale change) accumulates enough error that margin=0.8 already has
+#     2 failing elements, wrongly DISABLING the path for a configuration
+#     that must be accepted.
+#   - margin=0.9 (gate_atol=0.0018, gate_rtol=1.8%) is the sweet spot: ZERO
+#     failing elements at every "must accept" case tried -- default shape,
+#     causal+padding, batch=32/seq=512, the wide/L12 shape, seq_len=2048,
+#     and --input-scale in {1.0, 2.0, 4.0} -- while --input-scale 0.5 already
+#     has 5 failing elements (0.25 has 98, 0.1 has 105), giving real
+#     separation from the "must reject" cases without being so strict it
+#     rejects legitimate shapes.
+_FP16_GEMM_GATE_MARGIN = 0.9
+
+
 class _GraphCacheEntry:
     """Holds one captured CUDA graph plus the static input/output buffers it
     was captured against. Replaying requires copy_-ing fresh data into
@@ -292,6 +366,31 @@ class UserOptimizedTransformer(BaselineTransformer):
          true (so dynamo tracing the model via --compile-user never traces
          graph capture), or -- permanently for that cache key -- if capture
          itself raises.
+      7. fp32-only fp16-GEMM path, gated by runtime calibration: on the
+         fp32 model (never fp16/bf16 -- those stay untouched and bit-exact),
+         every GEMM in a layer (fused QKV, out_proj, ffn_in, ffn_out) and
+         attention itself casts its activations/weights to fp16, runs the
+         op, and casts the result straight back to fp32 immediately;
+         LayerNorm, GELU, the residual adds, and the final norm all stay
+         fp32. fp16 weight/bias copies are cached lazily (see
+         _get_linear_fp16_weights / _get_fused_qkv_weights_fp16), never
+         re-cast every forward. This is fast (fp16 cublas GEMMs run ~1.8-2x
+         the TF32 throughput measured on this GPU) but its error scales as
+         1/std(residual stream), so it silently stops being accurate once
+         the input is scaled down far enough. Because that depends on the
+         actual data, not just the shape, it cannot be decided statically:
+         the FIRST forward for a given (shape, dtype, device, causal,
+         mask_kind) configuration runs BOTH the existing fp32 path and the
+         fp16-GEMM candidate on that call's real input and compares them
+         (_calibrate_fp16_gemm) against the harness's own criterion scaled
+         by a safety margin (_FP16_GEMM_GATE_MARGIN); the fp16-GEMM path is
+         only used from then on if every element cleared it, and the
+         verdict is cached per configuration key so calibration costs
+         exactly one extra forward at warmup and nothing at steady state.
+         Calibration is a device->host sync (like _resolve_mask_active) and
+         always runs before graph capture, never inside a captured region,
+         so the captured graph already contains whichever path calibration
+         selected.
 
     Parameter names/shapes are identical to BaselineTransformer (this class
     adds no new nn.Parameter/buffer), so copy_model_weights()'s strict
@@ -323,6 +422,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         #   the baseline by more than atol/rtol once compounded over layers).
         self._attn_use_sdpa: Optional[bool] = None
         self._attn_dtype_cache: Optional[torch.dtype] = None
+
+        # (tuple(x.shape), x.dtype, x.device, causal, mask_kind) -> bool.
+        # Calibrated verdict of whether the fp32-only fp16-GEMM path (item 7
+        # in the class docstring) is safe to use for that configuration.
+        # Populated once, on the first forward for a given key, by
+        # _calibrate_fp16_gemm; never touched for fp16/bf16 models (those
+        # never enter this dict -- _resolve_fp16_gemm_enabled short-circuits
+        # to False for them).
+        self._fp16_gemm_gate: Dict[Tuple, bool] = {}
 
         # --- CUDA graph capture/replay state (plain attributes only: no
         # nn.Parameter, no registered buffer, so load_state_dict(strict=True)
@@ -427,6 +535,81 @@ class UserOptimizedTransformer(BaselineTransformer):
             return False
         return True
 
+    def _calibrate_fp16_gemm(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+    ) -> bool:
+        """Runs once per (shape, dtype, device, causal, mask_kind)
+        configuration, on that configuration's actual first-forward input:
+        computes both the existing fp32 output and the fp16-GEMM candidate
+        output for the SAME x, and returns True only if every element clears
+        the harness's own accuracy criterion scaled by _FP16_GEMM_GATE_MARGIN
+        (see that constant's docstring for how the margin was chosen). This
+        is a device->host sync (like _resolve_mask_active) and must be
+        called before any CUDA graph capture -- never from inside a captured
+        region."""
+        with torch.inference_mode():
+            reference = self._forward_core(
+                x, valid_token_mask, mask_active, causal,
+                use_sdpa=True, use_fp16_gemm=False,
+            )
+            candidate = self._forward_core(
+                x, valid_token_mask, mask_active, causal,
+                use_sdpa=True, use_fp16_gemm=True,
+            )
+
+        atol, rtol = _fp16_gemm_gate_thresholds()
+        gate_atol = _FP16_GEMM_GATE_MARGIN * atol
+        gate_rtol = _FP16_GEMM_GATE_MARGIN * rtol
+
+        ref = reference.float()
+        cand = candidate.float()
+        abs_err = (cand - ref).abs()
+        rel_err = abs_err / ref.abs().clamp_min(1e-12)
+        ok = (abs_err <= gate_atol) | (rel_err <= gate_rtol)
+        passed = bool(torch.all(ok).item())
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            n_fail = int((~ok).sum().item())
+            print(
+                f"[fp16-gemm-gate] shape={tuple(x.shape)} causal={causal} "
+                f"mask_active={mask_active} margin={_FP16_GEMM_GATE_MARGIN} "
+                f"gate_atol={gate_atol:.6g} gate_rtol={gate_rtol:.6g} "
+                f"failed={n_fail}/{ok.numel()} "
+                f"max_abs={abs_err.max().item():.6g} -> "
+                f"{'ENABLE' if passed else 'DISABLE (fallback to fp32)'} fp16-GEMM",
+                file=sys.stderr,
+            )
+        return passed
+
+    def _resolve_fp16_gemm_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        mask_kind: str,
+    ) -> bool:
+        """Gate for the fp32-only fp16-GEMM path (docstring item 7). Never
+        touches the fp16/bf16 model paths (use_sdpa is fp32-exclusive, see
+        _resolve_attention_mode) and never runs fp16 GEMMs off-CUDA (fp16
+        matmul support/perf there is neither validated nor the point).
+        Otherwise, calibrates once per configuration key and caches the
+        verdict -- see _calibrate_fp16_gemm."""
+        if not use_sdpa or x.device.type != "cuda":
+            return False
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind)
+        cached = self._fp16_gemm_gate.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._calibrate_fp16_gemm(x, valid_token_mask, mask_active, causal)
+        self._fp16_gemm_gate[key] = verdict
+        return verdict
+
     def forward(
         self,
         x: torch.Tensor,
@@ -436,9 +619,6 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_sdpa = self._resolve_attention_mode()
         mask_active = self._resolve_mask_active(valid_token_mask)
 
-        if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa)
-
         if valid_token_mask is None:
             mask_kind = "none"
         elif mask_active:
@@ -446,23 +626,33 @@ class UserOptimizedTransformer(BaselineTransformer):
         else:
             mask_kind = "all_true"
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind)
+        # Calibration is a device->host sync, so -- like mask resolution --
+        # it must happen here, before any graph capture/replay below, never
+        # inside a captured region.
+        use_fp16_gemm = self._resolve_fp16_gemm_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, mask_kind
+        )
+
+        if not self._graph_capture_allowed(x):
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, mask_kind)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, mask_kind)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -489,6 +679,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         mask_active: bool,
         causal: bool,
         use_sdpa: bool,
+        use_fp16_gemm: bool,
         mask_kind: str,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
@@ -505,12 +696,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa)
+                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
         torch.cuda.current_stream().wait_stream(warmup_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa)
+            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -526,12 +717,21 @@ class UserOptimizedTransformer(BaselineTransformer):
         mask_active: bool,
         causal: bool,
         use_sdpa: bool,
+        use_fp16_gemm: bool = False,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
         already-resolved plain Python bool (see _resolve_mask_active) instead
         of computing it here, so this function performs no device->host sync
-        and is safe to run under torch.cuda.graph() capture."""
+        and is safe to run under torch.cuda.graph() capture.
+
+        `use_fp16_gemm` (fp32 model only -- see _resolve_fp16_gemm_enabled)
+        selects the calibrated fp16-GEMM path: every GEMM and SDPA call
+        itself run on fp16-cast activations/weights with the result cast
+        straight back to fp32, while LayerNorm/GELU/residual adds/final norm
+        stay fp32. It is only ever True when use_sdpa is also True (that
+        combination is fp32-exclusive); the fp16/bf16 manual-math branch
+        below is completely unaffected by it."""
         batch, seq_len, d_model = x.shape
 
         invalid_mask: Optional[torch.Tensor] = None
@@ -564,6 +764,47 @@ class UserOptimizedTransformer(BaselineTransformer):
         for layer in self.layers:
             attn = layer.attention
             normed = layer.norm1(x)
+
+            if use_fp16_gemm:
+                # Calibrated fp32-only fast path (docstring item 7): cast to
+                # fp16 at each GEMM's inputs, run it, cast the result
+                # straight back to fp32 -- LayerNorm/GELU/residual adds/
+                # final norm all stay fp32. Attention itself (SDPA) also
+                # runs on the fp16 q/k/v produced by the fused QKV GEMM, so
+                # context never round-trips through fp32 before out_proj.
+                fused_weight16, fused_bias16 = _get_fused_qkv_weights_fp16(attn)
+                qkv16 = F.linear(normed.to(torch.float16), fused_weight16, fused_bias16)
+                q16, k16, v16 = qkv16.split(d_model, dim=-1)
+                q16 = q16.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k16 = k16.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+                v16 = v16.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+
+                context16 = F.scaled_dot_product_attention(
+                    q16, k16, v16,
+                    attn_mask=attn_mask,
+                    is_causal=is_causal,
+                    scale=attn.scale,
+                )
+                context16 = context16.transpose(1, 2).reshape(batch, seq_len, d_model)
+
+                out_weight16, out_bias16 = _get_linear_fp16_weights(attn.out_proj)
+                attn_out = F.linear(context16, out_weight16, out_bias16).to(torch.float32)
+                if mask_active:
+                    attn_out = attn_out.masked_fill(invalid_mask, 0)
+
+                x = x + attn_out
+
+                normed2 = layer.norm2(x)
+                ffn_in_weight16, ffn_in_bias16 = _get_linear_fp16_weights(layer.ffn_in)
+                hidden = F.linear(normed2.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
+                hidden = F.gelu(hidden, approximate="none")
+                ffn_out_weight16, ffn_out_bias16 = _get_linear_fp16_weights(layer.ffn_out)
+                ffn_out = F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32)
+                x = x + ffn_out
+
+                if mask_active:
+                    x = x.masked_fill(invalid_mask, 0)
+                continue
 
             if use_sdpa:
                 # Fused QKV GEMM: fp16/fp32/bf16-safe *mathematically*, but
