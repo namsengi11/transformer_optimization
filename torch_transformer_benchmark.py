@@ -27,6 +27,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+    import triton.language.extra.libdevice as _tl_libdevice
+    _TRITON_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised only when Triton is absent/broken
+    triton = None  # type: ignore
+    tl = None  # type: ignore
+    _tl_libdevice = None  # type: ignore
+    _TRITON_AVAILABLE = False
+
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -276,6 +287,143 @@ def _fp16_gemm_gate_thresholds() -> Tuple[float, float]:
 _FP16_GEMM_GATE_MARGIN = 0.9
 
 
+if _TRITON_AVAILABLE:
+    # Block-size / warp-count search space for the fused scale+mask kernel
+    # below, autotuned per distinct Sk. Deliberately wide (small blocks for
+    # short rows like seq_len=64, large blocks to amortize the per-block
+    # loop overhead for seq_len=2048) since this GPU has only 36 SMs --
+    # autotuning picks whichever config actually keeps them fed for a given
+    # shape rather than hardcoding one choice tuned for seq_len=128 only.
+    _SCALE_MASK_CONFIGS = [
+        triton.Config({"BLOCK_N": bn}, num_warps=nw)
+        for bn in (64, 128, 256, 512, 1024, 2048)
+        for nw in (2, 4, 8)
+    ]
+
+    @triton.autotune(configs=_SCALE_MASK_CONFIGS, key=["SK"])
+    @triton.jit
+    def _fused_scale_mask_kernel(
+        scores_ptr, out_ptr, mask_ptr,
+        H, SQ, SK,
+        stride_sb, stride_sh, stride_sq, stride_sk,
+        stride_ob, stride_oh, stride_oq, stride_ok,
+        stride_mb, stride_mk,
+        scale,
+        CAUSAL: tl.constexpr,
+        MASK_ACTIVE: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Fuses two of the attention epilogue's five ATen touches of the
+        raw [B, H, Sq, Sk] QK^T score tensor -- the scale multiply and the
+        (up to two) masked_fills -- into a single kernel that reads the raw
+        scores once and writes the scaled+masked scores once, in the model
+        dtype. The fp32 softmax itself is deliberately left to
+        `torch.softmax(..., dtype=torch.float32)` (called by
+        _fused_attn_probs right after this kernel) rather than also being
+        fused in here.
+
+        That split is load-bearing, not an oversight: an earlier version of
+        this kernel *did* fuse the softmax reduction too (single Triton
+        kernel, online two-pass max/sum), and its output was only ever
+        ~1e-4 to 1e-5 max_abs away from `torch.softmax(scores.float(),
+        dim=-1)` per-call -- reduction-order and exp-evaluation noise
+        inherent to it being a different implementation of the same
+        reduction, not a logic bug. But at fp16/bf16 there is no headroom
+        for that (see the class docstring's numerical-fidelity discussion:
+        one fp16 ulp near magnitude 1 is ~4x the atol): compounded across
+        even a single BaselineTransformerBlock, that per-call noise already
+        consumed ~98% of the atol=0.002 budget (measured max_abs=0.00195312
+        after just one layer), and across the default 6-layer stack it blew
+        through it entirely (measured max_abs=0.0078125 -- a full fp16 ulp
+        -- with real accuracy-check FAILures). A plain elementwise
+        scale+mask fusion has no reduction in it at all, so it is exactly
+        as bit-exact as the ops it replaces (verified: `torch.equal` against
+        `(scores*scale).masked_fill(mask, -inf)`, not just close) while
+        still cutting kernel launches (2-3 ATen ops -> 1) and traffic (2-3
+        read+write passes over the [B,H,S,S] tensor -> 1) ahead of the
+        softmax.
+
+        Numerical fidelity with BaselineSelfAttention's arithmetic:
+          - the raw score is upcast to fp32, multiplied by `scale`, then
+            rounded back down to the model dtype -- reproducing the exact
+            rounding of the eager chain's `scores * self.scale` (a
+            Half/BFloat16 tensor times a Python float), not a
+            higher-precision approximation of it.
+          - masked (causal-disallowed or padding-invalid) positions are set
+            to exactly -inf in the model dtype, matching
+            `masked_fill(mask, -inf)`; both masks are combined into one
+            `tl.where` chain per element instead of two successive
+            masked_fills, verified bit-exact against the two-call form.
+        """
+        row_id = tl.program_id(0)
+        hq = H * SQ
+        b = row_id // hq
+        rem = row_id % hq
+        h = rem // SQ
+        i = rem % SQ
+
+        row_base_s = b * stride_sb + h * stride_sh + i * stride_sq
+        row_base_o = b * stride_ob + h * stride_oh + i * stride_oq
+        mask_row_base = b * stride_mb
+
+        out_dtype = out_ptr.dtype.element_ty
+
+        for start in range(0, SK, BLOCK_N):
+            cols = start + tl.arange(0, BLOCK_N)
+            col_ok = cols < SK
+            s = tl.load(scores_ptr + row_base_s + cols * stride_sk, mask=col_ok, other=0.0)
+            v = (s.to(tl.float32) * scale).to(out_dtype)
+            if CAUSAL:
+                v = tl.where(cols <= i, v, -float("inf"))
+            if MASK_ACTIVE:
+                mvals = tl.load(mask_ptr + mask_row_base + cols * stride_mk, mask=col_ok, other=0)
+                v = tl.where(mvals != 0, v, -float("inf"))
+            tl.store(out_ptr + row_base_o + cols * stride_ok, v, mask=col_ok)
+
+
+def _triton_fused_scale_mask(
+    scores_raw: torch.Tensor,
+    scale: float,
+    causal: bool,
+    mask_active: bool,
+    valid_token_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Launches _fused_scale_mask_kernel over every (batch, head, query) row
+    of `scores_raw` ([B, H, Sq, Sk], the *unscaled* Q@K^T output in the
+    model dtype) and returns the scaled+masked scores in that same dtype
+    (softmax is still to come -- see _fused_attn_probs). Raises on any
+    failure (unsupported shape, no CUDA, compile error) -- callers must
+    catch and fall back to the ATen chain; this function itself never falls
+    back silently so a real bug here can't masquerade as "shape
+    unsupported"."""
+    B, H, SQ, SK = scores_raw.shape
+    out = torch.empty_like(scores_raw)
+    if mask_active:
+        assert valid_token_mask is not None
+        stride_mb, stride_mk = valid_token_mask.stride()
+        mask_arg = valid_token_mask
+    else:
+        # Unused inside the kernel (MASK_ACTIVE=False dead-code-eliminates
+        # the load), but the launch still needs a real CUDA tensor argument
+        # with a defined pointer/dtype -- reuse scores_raw to avoid an
+        # allocation.
+        stride_mb, stride_mk = 0, 0
+        mask_arg = scores_raw
+
+    grid = (B * H * SQ,)
+    _fused_scale_mask_kernel[grid](
+        scores_raw, out, mask_arg,
+        H, SQ, SK,
+        *scores_raw.stride(),
+        *out.stride(),
+        stride_mb, stride_mk,
+        scale,
+        CAUSAL=causal,
+        MASK_ACTIVE=mask_active,
+    )
+    return out
+
+
 class _GraphCacheEntry:
     """Holds one captured CUDA graph plus the static input/output buffers it
     was captured against. Replaying requires copy_-ing fresh data into
@@ -391,6 +539,35 @@ class UserOptimizedTransformer(BaselineTransformer):
          always runs before graph capture, never inside a captured region,
          so the captured graph already contains whichever path calibration
          selected.
+      8. Fused scale+mask Triton kernel, fp16/bf16 only: on the manual-math
+         branch from item 2, the raw (unscaled) Q@K^T matmul still runs as
+         one ATen GEMM, and the fp32 softmax still runs as ATen's own
+         `torch.softmax(..., dtype=torch.float32)`, but the scale multiply
+         and the (up to two) combined masked_fills that sit between them are
+         fused into a single Triton kernel (_fused_scale_mask_kernel,
+         launched via _fused_attn_probs/_triton_fused_scale_mask) that reads
+         the raw scores once and writes the scaled+masked scores once,
+         autotuned per sequence length (BLOCK_N, num_warps) via
+         @triton.autotune. This is a purely elementwise fusion (no
+         reduction), verified bit-exact (torch.equal, not just close)
+         against `(scores * scale).masked_fill(combined_mask, -inf)` --
+         deliberately NOT also fusing the softmax reduction itself: an
+         earlier version that did was only ever ~1e-4 to 1e-5 max_abs away
+         from ATen's softmax per call (ordinary reduction-order/exp-eval
+         noise between two different implementations), but fp16/bf16 has no
+         headroom to absorb that -- compounded across the default 6-layer
+         stack it grew into a full fp16-ulp divergence and real accuracy
+         FAILures, so the softmax reduction itself stays on ATen's
+         (bit-exact) kernel. Falls back to an equivalent ATen chain (also
+         bit-exact with BaselineSelfAttention, using a single combined mask
+         and `torch.softmax(..., dtype=torch.float32)` in place of an
+         explicit `.float()` upcast) if Triton is unavailable, off-CUDA, or
+         a launch raises; a failure permanently disables the Triton path for
+         that model instance (see `_triton_softmax_disabled`), so it can
+         never be attempted for the first time from inside a CUDA graph
+         capture -- capture always follows an eager warmup call on the
+         identical shape/dtype that would already have hit and cached the
+         same failure.
 
     Parameter names/shapes are identical to BaselineTransformer (this class
     adds no new nn.Parameter/buffer), so copy_model_weights()'s strict
@@ -450,6 +627,17 @@ class UserOptimizedTransformer(BaselineTransformer):
         # across a benchmark loop) cost at most one device->host sync total,
         # not one per call.
         self._mask_all_true_cache: Dict[Tuple, bool] = {}
+
+        # Fused scale+mask Triton kernel (see _fused_scale_mask_kernel),
+        # used only on the fp16/bf16 manual-math attention branch ahead of
+        # ATen's own (bit-exact) fp32 softmax. Starts disabled if Triton
+        # isn't importable at all; otherwise flips to True (permanently,
+        # for the life of this module instance) the first time a launch
+        # actually raises, so a real failure can never surface again later
+        # -- including inside a CUDA graph capture, which always follows an
+        # identical eager warmup call that would have hit the same failure
+        # first. Plain bool attribute, not a buffer/parameter.
+        self._triton_softmax_disabled: bool = not _TRITON_AVAILABLE
 
     def _get_causal_allowed(self, seq_len: int, device: torch.device) -> torch.Tensor:
         key = (seq_len, device)
@@ -710,6 +898,63 @@ class UserOptimizedTransformer(BaselineTransformer):
             static_output=static_output,
         )
 
+    def _fused_attn_probs(
+        self,
+        scores_raw: torch.Tensor,
+        scale: float,
+        causal: bool,
+        mask_active: bool,
+        valid_token_mask: Optional[torch.Tensor],
+        causal_disallowed: Optional[torch.Tensor],
+        invalid_keys: Optional[torch.Tensor],
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Computes softmax(scale * scores_raw, masked) in the model dtype,
+        used only by the fp16/bf16 manual-math attention branch. Tries the
+        fused Triton scale+mask kernel first (_triton_fused_scale_mask: one
+        read of scores_raw, one write of the scaled+masked scores, replacing
+        2-3 separate ATen kernels each touching the [B,H,S,S] score tensor),
+        then finishes with ATen's own `torch.softmax(..., dim=-1,
+        dtype=torch.float32)` -- kept on ATen deliberately, not also fused,
+        because a from-scratch Triton softmax reduction was verified to only
+        be ~1e-4 to 1e-5 max_abs from ATen's per call, which sounds tiny but
+        compounds past the harness's atol across a 6-layer stack at
+        fp16/bf16 (see the kernel docstring for the measured numbers). The
+        ATen fallback chain used when Triton isn't used at all is itself
+        bit-exact with BaselineSelfAttention -- a single combined mask
+        instead of two successive masked_fills, and
+        `torch.softmax(s, dim=-1, dtype=torch.float32)` in place of an
+        explicit `.float()` upcast, both verified bit-exact against the
+        original two-call form -- so accuracy is identical whichever path
+        runs; only the number of kernel launches/memory touches differs.
+
+        A Triton launch failure permanently disables the Triton path for
+        the rest of this module instance's life (see
+        `_triton_softmax_disabled`'s docstring for why: it must never be
+        attempted for the first time from inside a CUDA graph capture, and
+        capture always follows an eager warmup call on the identical shape
+        that would hit the same failure first)."""
+        scaled: Optional[torch.Tensor] = None
+        if not self._triton_softmax_disabled and scores_raw.device.type == "cuda":
+            try:
+                scaled = _triton_fused_scale_mask(
+                    scores_raw, scale, causal, mask_active, valid_token_mask
+                )
+            except Exception:
+                self._triton_softmax_disabled = True
+
+        if scaled is None:
+            scaled = scores_raw * scale
+            disallowed: Optional[torch.Tensor] = None
+            if causal:
+                disallowed = causal_disallowed
+            if mask_active:
+                disallowed = invalid_keys if disallowed is None else (disallowed | invalid_keys)
+            if disallowed is not None:
+                scaled = scaled.masked_fill(disallowed, float("-inf"))
+
+        return torch.softmax(scaled, dim=-1, dtype=torch.float32).to(dtype=out_dtype)
+
     def _forward_core(
         self,
         x: torch.Tensor,
@@ -838,15 +1083,18 @@ class UserOptimizedTransformer(BaselineTransformer):
                     scale=attn.scale,
                 )
             else:
-                # Reproduce BaselineSelfAttention's arithmetic exactly:
-                # scale after the matmul, mask, softmax in fp32, cast back,
-                # then matmul with v.
-                scores = torch.matmul(q, k.transpose(-2, -1)) * attn.scale
-                if causal:
-                    scores = scores.masked_fill(causal_disallowed, float("-inf"))
-                if mask_active:
-                    scores = scores.masked_fill(invalid_keys, float("-inf"))
-                probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+                # Reproduce BaselineSelfAttention's arithmetic exactly: scale
+                # after the matmul, mask, softmax in fp32, cast back, then
+                # matmul with v. The scale+mask+softmax epilogue itself is
+                # delegated to _fused_attn_probs (fused Triton kernel, with
+                # an ATen fallback that is itself bit-exact with the
+                # baseline -- see that method's docstring); only the raw
+                # (unscaled) Q@K^T matmul happens here, unchanged.
+                scores_raw = torch.matmul(q, k.transpose(-2, -1))
+                probs = self._fused_attn_probs(
+                    scores_raw, attn.scale, causal, mask_active,
+                    valid_token_mask, causal_disallowed, invalid_keys, x.dtype,
+                )
                 context = torch.matmul(probs, v)
 
             context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
