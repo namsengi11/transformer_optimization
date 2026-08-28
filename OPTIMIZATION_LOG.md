@@ -1,0 +1,203 @@
+# Transformer inference optimization log
+
+Goal: make `UserOptimizedTransformer` faster than the stated bar (the
+`torch.compile`d baseline) without breaking the harness accuracy contract
+`abs(user - ref) <= atol OR abs(user - ref) <= rtol * abs(ref)`.
+
+Hardware: RTX 5060 Ti (sm_120 Blackwell, 36 SMs, 16 GB), torch 2.8.0+cu129,
+triton 3.4.0, Windows.
+
+---
+
+## 0. Environment fix (prerequisite)
+
+`torch.compile` was **completely broken** on this machine. The installed
+`triton-windows 3.6.0.post25` pairs with torch 2.9, and torch 2.8's inductor
+failed with `ImportError: cannot import name 'triton_key'`. Downgraded to
+`triton-windows==3.4.0.post21`. Reversible with
+`pip install triton-windows==3.6.0.post25`.
+
+## 1. Where the time actually goes
+
+Profile of the compiled baseline, default shape (B=8, S=128, d_model=512,
+heads=8, ffn=2048, layers=6), fp32/TF32:
+
+| component | share | detail |
+|---|---|---|
+| GEMMs (projections + FFN) | **85%** (1.93 ms) | `cutlass_80_tensorop_s1688gemm` — Ampere-tuned TF32 kernels on an sm_120 part, ~20.8 TFLOPS |
+| attention bmm + softmax | 5% | inductor did **not** pattern-match to SDPA |
+| everything else | 10% | 146 kernel launches/iter; CPU time approximately equals GPU time |
+
+GEMM ceiling, measured directly (TFLOPS):
+
+| shape | TF32 | fp32 (no TF32) | fp16 | bf16 |
+|---|---|---|---|---|
+| `[1024,512]x[512,512]` qkv | 17.6 | 10.5 | 31.8 | 15.5 |
+| `[1024,512]x[512,1536]` qkv fused | 20.7 | 12.7 | 38.0 | 34.4 |
+| `[1024,512]x[512,2048]` ffn_in | 19.2 | 12.7 | 40.1 | 35.2 |
+| `[1024,2048]x[2048,512]` ffn_out | 21.1 | 12.9 | 37.2 | 39.5 |
+
+Launch-overhead breakdown of the optimized eager model:
+
+| dtype | eager | kernel sum | launches | overhead | CUDA-graph replay |
+|---|---|---|---|---|---|
+| fp32 | 2.44 ms | 2.28 ms | 61 | 6.7% | 2.30 ms |
+| fp16 | 2.39 ms | 1.64 ms | 157 | 31.6% | 1.71 ms |
+| bf16 | 2.07 ms | 1.55 ms | 127 | 25.1% | 1.59 ms |
+
+## 2. The constraint that shaped everything
+
+**`torch.compile` changes the baseline's own low-precision numerics by more than
+the tolerance.** Compiled baseline vs eager baseline, with none of our code
+involved:
+
+| dtype | max_abs | failing elements | verdict |
+|---|---|---|---|
+| fp32 | 0.00062 | 0 / 524288 | PASS |
+| fp16 | 0.01172 | 21 | **FAIL** |
+| bf16 | 0.09375 | 65102 (12%) | **FAIL** |
+
+(`torch._inductor.config.emulate_precision_casts=True` only narrows bf16 to
+51320 failures.)
+
+So the eager baseline and the compiled baseline are **two mutually incompatible
+references** — no implementation can be within tolerance of both. Because
+accuracy is measured *against the baseline*, being **more** accurate than it
+also counts as divergence. And low precision has no headroom at all: one bf16
+ulp at magnitude 1.0 is 0.0078, roughly 4x the atol of 0.002.
+
+This splits the problem in two:
+
+* **fp32** has real headroom, so SDPA, fp16 GEMMs and aggressive fusion are all
+  available.
+* **fp16/bf16** admit only **arithmetic-preserving** changes: CUDA graphs and
+  rounding-faithful fusion. `torch.compile` is off-limits *for our own model
+  too*, not just for the baseline.
+
+`run_bench.py` therefore separates the two things the harness conflates:
+correctness is judged against the **eager** baseline (the harness default, and
+the true semantic reference), while the speed bar is the **compiled** baseline's
+latency, taken as the fastest of N runs so every reported speedup is a lower
+bound. That bar has roughly 30% run-to-run variance across processes.
+
+## 3. Changes, in order
+
+Each step was developed on its own branch and merged only after measurement.
+
+| step | change | geomean vs bar | accuracy |
+|---|---|---|---|
+| — | unmodified `UserOptimizedTransformer` | 0.80x | 5/5 |
+| 1 | fused QKV + dtype-dependent attention path | 0.699x | 5/5 |
+| 2 | CUDA graph capture/replay | 1.001x | 5/5 |
+| 3 | fp16 GEMMs for fp32 models + calibration gate | 1.044x | 5/5 |
+| 4 | bit-exact Triton scale+mask fusion | 1.038x* | 5/5 |
+
+\* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
+causal and padded cases.
+
+### Step 1 — fused QKV + dtype-dependent attention
+
+One GEMM for q/k/v instead of three, `F.scaled_dot_product_attention`, a mask
+fast-path, and a cached causal mask. Then split by dtype, because SDPA diverges
+from the baseline by ~0.0015 per op in fp16 — *identically* for the MATH backend
+and for fp32-upcast inputs, so it is not an accumulation-precision problem. The
+baseline scales after the QK matmul and re-quantizes `probs` to the model dtype;
+SDPA scales `q` first and keeps higher-precision probs.
+
+* fp32 uses SDPA + fused QKV.
+* fp16/bf16 reproduce the baseline arithmetic exactly, **with three separate
+  projection GEMMs**, because fusing them changes cuBLAS kernel selection enough
+  to break near-zero elements at atol=0.002.
+
+Also found: **this Windows build has no flash attention at all**
+(`Torch was not compiled with flash attention`); only the MATH, EFFICIENT and
+CUDNN backends exist. The stated bar is really "torch.compile + inductor
+bmm/softmax", not "torch.compile + flash SDPA".
+
+### Step 2 — CUDA graphs
+
+Graph replay runs identical kernels with identical arithmetic, which makes it
+the one large lever that is legal in low precision. The cache is keyed on
+`(shape, dtype, device, causal, mask_kind)`, and falls back to eager permanently
+on capture failure, on non-CUDA devices, and under
+`torch.compiler.is_compiling()`.
+
+`mask.all()` is a device-to-host sync and is **illegal during capture** — it
+poisons the entire CUDA context. It is hoisted out of the captured region and
+memoized per mask tensor: at most one sync per distinct mask, zero when warm.
+
+Largest wins on small shapes (fp32 b1/s64: **7.38x**), where launch overhead
+dominates everything else.
+
+### Step 3 — fp16 GEMMs for fp32 models, behind a calibration gate
+
+fp32 models run their GEMMs and SDPA in fp16 with results cast straight back to
+fp32, while LayerNorm, GELU, the residual adds and the final norm stay fp32.
+Naive whole-model fp16 casting **fails** (max_abs 0.0082) and bf16 fails badly
+(0.074); confining fp16 to the GEMMs passes everywhere at normal input scale
+(max_abs 0.0012–0.0019).
+
+The error scales as **1/std(residual)**, so small inputs break it:
+
+| `--input-scale` | 4.0 | 2.0 | 1.0 | 0.5 | 0.25 | 0.1 |
+|---|---|---|---|---|---|---|
+| failures @ (2e-3, 2%) | 0 | 0 | 0 | 2 | 25 | 48 |
+| max_abs | 0.00034 | 0.00064 | 0.00122 | 0.00218 | 0.00288 | 0.00287 |
+
+So a **runtime calibration gate** compares the fp16 path against the fp32 path
+on the *real* input at warmup, and enables fp16 only if nothing fails
+`abs <= 0.9*atol OR rel <= 0.9*rtol`. The 0.9 margin was chosen empirically:
+1.0 wrongly accepts input-scale 0.5, and <=0.8 wrongly rejects the
+d_model=1024 / 12-layer config. Calibration runs before graph capture, since it
+syncs. Tolerances are overridable via `TJ_ATOL` / `TJ_RTOL`.
+
+Result: fp32 1.061x -> **1.588x** (2.28 ms -> 1.53 ms).
+
+### Step 4 — Triton scale+mask fusion (bit-exact)
+
+The attention epilogue streamed the score tensor about five times per layer
+(~130 MB per forward). Fusing the scale and the combined mask into a single
+Triton elementwise kernel, feeding `softmax(dtype=float32)` directly, removed
+the explicit `.float()` pass: epilogue 56.09 -> 37.59 us/call (-33%).
+
+**The softmax reduction itself could not be fused.** A Triton `tl.max`/`tl.sum`
+reduction tree does not match ATen's softmax bit-for-bit, and the resulting
+1e-5..1e-4 per-call difference compounds through the residual stream to
+max_abs 0.0078 over 6 layers — real failures. The reduction stays on ATen.
+
+## 4. Rejected after measurement
+
+| idea | why rejected |
+|---|---|
+| **KV caching** | Not applicable. The harness does one full-sequence forward per call, with no autoregressive decode and no cross-call state. There is no incremental step to cache K/V for, and caching across identical benchmark calls would just memoise the answer. |
+| `torch.compile` on our own model (fp16/bf16) | Changes numerics past tolerance vs the eager reference — the same drift that makes the compiled baseline non-compliant. |
+| Whole-model fp16 / bf16 cast | fp16 max_abs 0.0082, bf16 0.074 — both fail. |
+| Error-compensated fp16 (hi+lo split GEMM) | Two fp16 GEMMs cost about as much as one TF32 GEMM. No win. |
+| Folding the attention scale into `W_q`/`b_q` | 3.9e-3 divergence in fp16 (bit-exact in bf16 only). Unsafe. |
+| Fused QKV in fp16/bf16 | Changes cuBLAS kernel selection; breaks near-zero elements. |
+| Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. |
+| Inductor max-autotune GEMM | Disabled on this GPU: inductor warns "Not enough SMs to use max_autotune_gemm mode" (36 SMs). |
+
+## 5. Behaviour against a compiled baseline
+
+If the harness is run with `--compile-baseline`, the reference itself changes:
+
+| dtype | verdict | failing elements | speedup |
+|---|---|---|---|
+| fp32 | PASS | 0 / 2,621,440 | 1.589x |
+| fp16 | FAIL | 108 / 2,621,440 (0.004%) | 1.030x |
+| bf16 | FAIL | 325,859 (12.4%) | 1.128x |
+
+Those fp16 failures closely match the count obtained by comparing the **eager
+baseline against its own compiled self** (about 21 per trial over 5 trials). In
+other words, this implementation is as close to the compiled baseline as the
+reference implementation itself is; the failures are the compiled baseline's own
+numerical drift, not an artifact of these optimizations.
+
+## 6. Reproducing
+
+```
+python run_bench.py --suite default    # 5 configs, correctness + speed
+python run_bench.py --suite full       # 10 configs incl. long-seq and wide
+python profile_baseline.py float32     # kernel-level profile of the bar
+```
