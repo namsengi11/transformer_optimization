@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """Reproducible driver for torch_transformer_benchmark.py.
 
-Runs a fixed suite of shapes/dtypes with the baseline torch.compile'd
-(the stated bar: torch.compile + SDPA/flash), parses the reported speedup,
-and prints a summary table plus a geometric mean.
+MEASUREMENT PROTOCOL (why each case is run twice)
+-------------------------------------------------
+torch.compile changes the BASELINE's own fp16/bf16 numerics by more than the
+harness tolerance (measured: bf16 max_abs 0.094, 12% of elements fail; fp16
+max_abs 0.0117). So "eager baseline" and "compiled baseline" are two mutually
+incompatible references -- no implementation can be within tolerance of both.
+
+We therefore split the two things the harness conflates:
+
+  * CORRECTNESS is judged against the EAGER baseline (the harness's default
+    configuration and the true semantic reference)  -> run without
+    --compile-baseline.
+  * SPEED is judged against the COMPILED baseline (the stated bar:
+    torch.compile) -> run with --compile-baseline, and we take only its
+    baseline latency.
+
+speedup = compiled_baseline_median_ms / optimized_median_ms
 
 Usage:
     python run_bench.py [--suite default|full|quick] [--tag NAME]
@@ -107,10 +121,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="default", choices=sorted(SUITES))
     ap.add_argument("--tag", default=None, help="label for the results file")
-    ap.add_argument("--no-compile-baseline", action="store_true",
-                    help="do NOT torch.compile the baseline (easier bar)")
     ap.add_argument("--compile-user", action="store_true",
                     help="also wrap the user model in torch.compile externally")
+    ap.add_argument("--skip-speed-bar", action="store_true",
+                    help="skip the compiled-baseline run (correctness only)")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--case", action="append", default=None,
                     help="run only these case names")
@@ -126,41 +140,69 @@ def main() -> int:
 
     results = []
     for name, extra in cases.items():
-        print(f"[run_bench] {name} ...", flush=True)
-        r = run_case(name, extra, not args.no_compile_baseline,
-                     args.compile_user, args.timeout)
-        results.append(r)
-        s = r.get("speedup")
-        print(f"[run_bench]   speedup={s} acc={r.get('accuracy')} "
-              f"base={r.get('baseline_ms')}ms opt={r.get('optimized_ms')}ms "
-              f"({r['wall_s']}s)", flush=True)
-        if r.get("log"):
-            print(r["log"], flush=True)
+        print(f"[run_bench] {name} (correctness vs eager baseline) ...", flush=True)
+        acc_run = run_case(name, extra, False, args.compile_user, args.timeout)
 
-    ok = [r for r in results if r.get("speedup") and r.get("accuracy") == "PASS"]
-    print("\n" + "=" * 78)
-    print(f"SUITE={args.suite}  TAG={tag}  "
-          f"(baseline {'NOT ' if args.no_compile_baseline else ''}compiled)")
-    print("=" * 78)
-    hdr = f"{'case':<18} {'acc':<5} {'base_ms':>9} {'opt_ms':>9} {'speedup':>9} {'max_rel':>10}"
+        bar = None
+        if not args.skip_speed_bar:
+            print(f"[run_bench] {name} (speed bar: compiled baseline) ...", flush=True)
+            bar_run = run_case(name, extra, True, args.compile_user, args.timeout)
+            bar = bar_run.get("baseline_ms")
+
+        opt_ms = acc_run.get("optimized_ms")
+        r = {
+            "name": name,
+            "cmd": acc_run.get("cmd"),
+            "accuracy": acc_run.get("accuracy"),
+            "max_abs": acc_run.get("max_abs"),
+            "max_rel": acc_run.get("max_rel"),
+            "eager_baseline_ms": acc_run.get("baseline_ms"),
+            "compiled_baseline_ms": bar,
+            "optimized_ms": opt_ms,
+            "speedup_vs_compiled": (bar / opt_ms) if (bar and opt_ms) else None,
+            "speedup_vs_eager": ((acc_run.get("baseline_ms") or 0) / opt_ms)
+                                 if opt_ms else None,
+            "wall_s": acc_run["wall_s"],
+        }
+        results.append(r)
+        print(f"[run_bench]   acc={r['accuracy']} opt={opt_ms}ms "
+              f"eager_base={r['eager_baseline_ms']}ms compiled_base={bar}ms "
+              f"speedup_vs_compiled={r['speedup_vs_compiled']}", flush=True)
+        if acc_run.get("log"):
+            print(acc_run["log"], flush=True)
+
+    print(chr(10) + "=" * 92)
+    print(f"SUITE={args.suite}  TAG={tag}")
+    print("correctness vs EAGER baseline | speed vs COMPILED baseline")
+    print("=" * 92)
+    hdr = (f"{'case':<18} {'acc':<5} {'eager_ms':>9} {'compiled_ms':>12} "
+           f"{'opt_ms':>9} {'vs_compiled':>12} {'vs_eager':>10}")
     print(hdr)
     print("-" * len(hdr))
+    nan = float("nan")
     for r in results:
-        print(f"{r['name']:<18} {str(r.get('accuracy')):<5} "
-              f"{r.get('baseline_ms') or float('nan'):>9.4f} "
-              f"{r.get('optimized_ms') or float('nan'):>9.4f} "
-              f"{r.get('speedup') or float('nan'):>8.3f}x "
-              f"{str(r.get('max_rel')):>10}")
+        print(f"{r['name']:<18} {str(r['accuracy']):<5} "
+              f"{r['eager_baseline_ms'] or nan:>9.4f} "
+              f"{r['compiled_baseline_ms'] or nan:>12.4f} "
+              f"{r['optimized_ms'] or nan:>9.4f} "
+              f"{r['speedup_vs_compiled'] or nan:>11.3f}x "
+              f"{r['speedup_vs_eager'] or nan:>9.3f}x")
+
+    ok = [r for r in results
+          if r["accuracy"] == "PASS" and r["speedup_vs_compiled"]]
+    print("-" * len(hdr))
     if ok:
-        gmean = statistics.geometric_mean([r["speedup"] for r in ok])
-        print("-" * len(hdr))
-        print(f"geomean speedup over {len(ok)}/{len(results)} passing cases: {gmean:.3f}x")
+        g = statistics.geometric_mean([r["speedup_vs_compiled"] for r in ok])
+        print(f"geomean speedup vs COMPILED baseline over {len(ok)}/{len(results)} "
+              f"passing cases: {g:.3f}x")
+    n_pass = sum(1 for r in results if r["accuracy"] == "PASS")
+    print(f"accuracy: {n_pass}/{len(results)} cases PASS vs eager baseline")
 
     outdir = Path("results")
     outdir.mkdir(exist_ok=True)
     path = outdir / f"{tag.replace('/', '_')}_{args.suite}.json"
     path.write_text(json.dumps(results, indent=2))
-    print(f"\nwrote {path}")
+    print(f"{chr(10)}wrote {path}")
     return 0
 
 
