@@ -239,6 +239,53 @@ other words, this implementation is as close to the compiled baseline as the
 reference implementation itself is; the failures are the compiled baseline's own
 numerical drift, not an artifact of these optimizations.
 
+## 5b. Standing measurement protocol: MFU alongside the latency ratio
+
+Every `run_bench.py` run now reports each case's **MFU** (Model FLOPs
+Utilization) alongside the existing latency-ratio speedup, and the
+arithmetic-mean MFU across all shapes in the suite. Dense forward FLOPs
+(QKV + attn QK^T + attn@V + out_proj + FFN GEMMs; LayerNorm/softmax/GELU
+excluded, the standard convention; no discount for causal masking since the
+full `[S,S]` score matrix is computed either way) divided by measured
+latency, divided by this GPU's peak FLOPs/s at the precision *actually
+executed*.
+
+Peak FLOPs/s is **measured empirically** on this card (large square GEMMs),
+not taken from a spec sheet — web sources for the RTX 5060 Ti's tensor-core
+TFLOPS were inconsistent (47/120/200 TFLOPS all cited for the same SKU):
+TF32 ~24.7, FP16 ~48.8, BF16 ~49.4 TFLOPS. FP16 measuring ~2x TF32 is the
+expected, generation-independent tensor-core ratio and a sanity check these
+are real.
+
+Found and fixed a bug while wiring this up: an fp32 case where the
+fp16-GEMM calibration gate (§3) silently enables its fast path was being
+scored against the TF32 peak instead of the FP16 peak it actually runs on,
+producing an impossible 120% MFU. Fixed by surfacing the gate's decision via
+the existing `TJ_DEBUG_GATE` stderr marker and picking the matching peak.
+
+**MFU is only a fair comparison within the same executed precision.**
+Current `default` suite:
+
+| case | speedup vs bar | MFU (ours) | MFU (compiled bar) |
+|---|---|---|---|
+| default_fp32 | 1.793x | 60.98%* | 67.19% |
+| default_fp16 | 0.894x | 49.76% | 55.63% |
+| default_bf16 | 1.170x | 53.33% | 45.58% |
+| causal_fp16 | 0.878x | 49.24% | 56.09% |
+| padded_fp16 | 0.855x | 47.06% | 55.07% |
+| **average** | **1.071x geomean** | **52.07%** | **55.91%** |
+
+\* against the FP16 peak (48.8 TFLOPS), since the gate enables fp16-GEMM
+here; the bar's 67.19% is against TF32's peak (24.7 TFLOPS) since
+`BaselineTransformer` never takes that path. Different ceilings — our lower
+percentage of a higher ceiling (~29.8 TFLOPS achieved) still beats the
+bar's higher percentage of a lower one (~16.6 TFLOPS achieved), which is
+exactly why default_fp32 is faster despite the lower MFU%. For the fp16/bf16
+rows both sides share the same peak, so those percentages ARE directly
+comparable, and confirm the already-known story: the compiled baseline's
+fusion (unavailable to us there without breaking bit-exactness) gives it a
+genuine edge on `default_fp16`/`causal_fp16`/`padded_fp16`.
+
 ## 6. Reproducing
 
 ```
