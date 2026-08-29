@@ -93,6 +93,7 @@ Each step was developed on its own branch and merged only after measurement.
 | 4 | bit-exact Triton scale+mask fusion | 1.038x* | 5/5 |
 | 5 | fix long_fp16 accuracy bug; chunked FFN for extreme shapes | 1.060x | 5/5 |
 | 6 | bit-exact fp16 GELU (no fp32 round-trip) | 1.072x | 5/5 |
+| 7 | investigated autotuned Triton GEMM vs cuBLAS -- **no change merged** | 1.078x (unchanged) | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -210,6 +211,116 @@ to the upcast/downcast round trip — removing it costs nothing numerically
 while cutting 2 elementwise kernel launches and halving that op's memory
 traffic. `default_fp32`: 1.586x -> **1.786x** vs the compiled bar.
 
+### Step 7 — investigated: autotuned Triton GEMM vs cuBLAS (no change merged)
+
+Re-opened the "Inductor max-autotune GEMM" rejection from §4 to check whether
+its SM-count gate is actually well-calibrated for this 36-SM card, since our
+workload amortizes autotuning at warmup (once) and replays via CUDA graph
+indefinitely — the opposite of inductor's one-shot-compile assumption that
+the gate is written for.
+
+**Where the gate lives**: `torch/_inductor/utils.py::is_big_gpu()` —
+`min_sms = 68  # 3080` (108/132 for A100/H100 aren't even it; 68 is an
+RTX 3080). Our 36 SMs trip it. It gates `_use_template_for_gpu`, which is
+the only caller.
+
+**Bypassing it**: `torch._inductor.utils.is_big_gpu` is looked up as a
+plain module global by its one caller, so monkeypatching the module
+attribute (`inductor_utils.is_big_gpu = lambda *a, **k: True`) is enough —
+no source patch, no private-API contortions. With
+`config.max_autotune_gemm = True` this does make inductor autotune real
+Triton GEMM templates for this GPU.
+
+Two unrelated bugs surfaced immediately, both worth recording:
+  * **Windows-only crash**: `torch._inductor.config.use_static_cuda_launcher`
+    (on by default in torch 2.8) overflows a C `long` with the 64-bit CUDA
+    stream handle inside `static_cuda_launcher.py`'s `_launch_kernel`
+    (`OverflowError: Python int too large to convert to C long`) the moment
+    a compiled Triton template actually runs. Unrelated to SM count or this
+    project; setting `config.use_static_cuda_launcher = False` (falls back
+    to the ordinary launcher) fixes it. Filed here so it isn't
+    re-discovered as "autotune doesn't work" next time.
+  * **Confirms the 99KiB shared-memory ceiling** stated in this project's
+    hardware notes: several autotune candidates with `BLOCK_K=128` at
+    128-wide M/N tiles failed with `OutOfMemoryError: out of resource:
+    triton_mm Required: 131072/147456 Hardware limit:101376` (101376 B =
+    99 KiB) during inductor's own candidate search — a real, measured
+    number, not an assumption.
+
+**Result (fp16 F.linear, matching what the fp32 fast path's GEMMs actually
+run under; median of repeated `torch.cuda.Event`-timed trials, 20 warmup +
+100-200 iters each)**:
+
+| shape (M x K x N) | cuBLAS TFLOPS | inductor-autotuned Triton TFLOPS | ratio |
+|---|---|---|---|
+| qkv_fused, default (1024x512x1536) | 39.6 | 30.4 | 0.77x |
+| out_proj, default (1024x512x512) | 21.7 | 12.2 | 0.56x |
+| ffn_in, default (1024x512x2048) | 40.7 | 28.3 | 0.70x |
+| ffn_out, default (1024x2048x512) | 39.9 | 30.3 | 0.76x |
+| qkv_fused, big (16384x512x1536) | 46.2 | 41.5 | 0.90x |
+| out_proj, big (16384x512x512) | 44.9 | 31.6 | 0.70x |
+| ffn_in, big (16384x512x2048) | 46.4 | 43.1 | 0.93x |
+| ffn_out, big (16384x2048x512) | 48.8 | 32.4 | 0.66x |
+
+cuBLAS wins every shape, sometimes by a lot (out_proj default: 0.56x).
+Inductor's stock Triton MM template (BLOCK_M/N capped at 128,
+`num_stages<=5`, a handful of `num_warps`) never comes close on this card.
+
+**Then hand-wrote a Triton GEMM** (`@triton.autotune` over
+`BLOCK_M/N/K in {32,64,128}`, `num_stages in {2,3,4}`,
+`num_warps in {2,4,8}`, filtered to configs whose estimated shared-memory
+footprint stays under 99 KiB — 159 valid configs total; grouped-tile
+ordering for L2 reuse) specifically to give the search room for tile sizes
+that reach reasonable occupancy on 36 SMs at these shapes (e.g. `out_proj`
+default at BLOCK_M=BLOCK_N=64 gives 128 tiles across 36 SMs, vs. inductor's
+128x128 default giving only 32 — under-subscribed). This closed most of the
+gap and even edged ahead at the bigger shapes, but the result is a wash, not
+a win:
+
+| shape | cuBLAS ms (best-of-3) | hand-written Triton ms (best-of-3) | ratio (triton/cublas) |
+|---|---|---|---|
+| out_proj, default | 0.0253 | 0.0340 | **1.34x slower** |
+| qkv_fused, big | 0.5667 | 0.5443 | 0.96x (faster) |
+| out_proj, big | 0.1899 | 0.1879 | 0.99x (~tied) |
+| ffn_in, big | 0.7678 | 0.7171 | 0.93x (faster) |
+| ffn_out, big | 0.7274 | 0.7417 | 1.02x (slower) |
+
+At the shape that actually matters — `default` (batch=8, seq=128), the one
+`run_bench.py`'s `default_fp32` case runs — Triton is at-best tied
+(qkv_fused, ffn_in, ffn_out within 2-4% either way across repeated runs)
+and clearly loses on `out_proj` (25-34% slower, reproducible across
+repeated trials, not a one-off). Summed over one layer's 4 GEMMs at the
+default shape, an all-Triton layer is **~7% slower** than the existing
+all-cuBLAS path, so there's no per-shape substitution that helps here: even
+cherry-picking cuBLAS for `out_proj` and Triton for the rest is still
+slightly slower than what already ships, because none of the other three
+GEMMs actually beat cuBLAS at this shape either — they just come close.
+
+The bigger shape (batch=32, seq=512) shows a real but small edge on 3 of 4
+GEMM types (qkv_fused, out_proj, ffn_in: 1-7%, reproducing in sign but not
+magnitude across two independent runs) and no edge at all on `ffn_out`
+(flipped sign between runs — noise). None of this shows up in
+`run_bench.py`'s `default` suite, which only exercises the smaller shape,
+and a few-percent edge is well inside the harness's own documented ~30%
+run-to-run variance — not a "real, repeatable win" by this project's bar.
+
+**Conclusion: no code change.** cuBLAS already wins or ties at every shape
+this codebase actually runs. The SM-count gate's *literal* premise (`36 SMs
+< 68`, calibrated off an RTX 3080) doesn't hold up as the reason Triton
+loses here — bypassing it and autotuning for real does find configs that
+almost close the gap, and even edges ahead at larger shapes — but the
+practical reason autotuning doesn't pay off on this card is simpler:
+**NVIDIA's Blackwell (sm_120) cuBLAS kernels are already very good for
+these matrix sizes**, and a generic tile-based Triton MMA schedule (whether
+inductor's own template or a hand-tuned one) doesn't have enough headroom
+over them at this scale to justify the autotuning cost — which is real:
+159 configs x compile-and-time per novel shape took on the order of tens of
+seconds to minutes per shape in this investigation, far more than the
+existing fp16-GEMM gate's "one extra forward pass" calibration cost, for a
+payoff that isn't there at the shape that matters. `_resolve_fp16_gemm_enabled`'s
+existing cuBLAS fp16-GEMM path (step 3) remains the fastest fp32 GEMM path
+found on this hardware.
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
@@ -221,7 +332,7 @@ traffic. `default_fp32`: 1.586x -> **1.786x** vs the compiled bar.
 | Folding the attention scale into `W_q`/`b_q` | 3.9e-3 divergence in fp16 (bit-exact in bf16 only). Unsafe. |
 | Fused QKV in fp16/bf16 | Changes cuBLAS kernel selection; breaks near-zero elements. |
 | Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. |
-| Inductor max-autotune GEMM | Disabled on this GPU: inductor warns "Not enough SMs to use max_autotune_gemm mode" (36 SMs). |
+| Inductor max-autotune GEMM (or a hand-written Triton GEMM) | Disabled on this GPU by inductor's SM-count gate (36 < 68 SMs); bypassed it and also hand-tuned a Triton GEMM for this exact hardware in step 7 -- cuBLAS still wins or ties at every shape this codebase actually runs. |
 
 ## 5. Behaviour against a compiled baseline
 
