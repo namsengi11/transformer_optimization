@@ -449,3 +449,41 @@ python run_bench.py --suite default    # 5 configs, correctness + speed
 python run_bench.py --suite full       # 10 configs incl. long-seq and wide
 python profile_baseline.py float32     # kernel-level profile of the bar
 ```
+
+## 7. Observation: progressive residual-stream boundary push (fp32-target, not baseline-bf16-match)
+
+Reframed question: not "match baseline's own low-precision arithmetic" but
+"match baseline's fp32 output, using as much fp16 internally as passes
+calibration" -- i.e., extend the existing fp16-GEMM gate's scope further into
+the pipeline. Current merged design (`_forward_core`'s `use_fp16_gemm` path)
+already runs every GEMM, attention, and GELU in fp16; only the residual
+stream `x` itself and LayerNorm's protected input stay fp32.
+
+Tested pushing the residual stream itself into fp16, progressively, at
+default/causal/deep(L12,d1024) shapes, across 3 seeds x 6 input scales, at
+the SAME 0.9-margin gate the production code uses:
+
+- Level A (current): x fp32 throughout -> passes down to scale=1.0, fails at
+  0.5 and below (matches the production gate's documented behavior).
+- Level B (x fp16 through attention's residual add only, back to fp32 before
+  FFN): fails starting at scale=1.0 (default/causal) or scale=2.0 (deep) --
+  i.e., fails at the realistic default scale immediately.
+- Level C (x fp16 through both residual adds): barely worse than B
+  (max_abs 0.00853 vs 0.00782 at default/scale=1.0) -- the SECOND fp16 touch
+  adds little on top of the first.
+
+**Observation, not a closed conclusion**: there is no calibration-passing
+middle ground between "residual stays fully fp32" (current) and "residual
+touches fp16 at all" (fails immediately at realistic scale) for this specific
+way of dropping precision (an immediate half-cast at the residual add). B and
+C being nearly identical suggests the FIRST fp16 rounding of the accumulated
+residual does most of the damage -- it re-rounds the entire accumulated value
+at that point, which then propagates through every remaining layer -- rather
+than damage accumulating gradually with more fp16 exposure. This has only
+been tested for one specific perturbation shape (immediate cast, no
+compensation); it does not rule out a differently-designed residual update
+(e.g. compensated/error-feedback accumulation) surviving calibration --
+though such a design would need its own scrutiny for whether it still
+qualifies as a legitimate approximation of the true fp32 computation. Current
+production boundary (Level A) is not merely "the one we picked" -- it appears
+to sit right at the edge of what this shape of perturbation can survive.
