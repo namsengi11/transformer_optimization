@@ -91,6 +91,8 @@ Each step was developed on its own branch and merged only after measurement.
 | 2 | CUDA graph capture/replay | 1.001x | 5/5 |
 | 3 | fp16 GEMMs for fp32 models + calibration gate | 1.044x | 5/5 |
 | 4 | bit-exact Triton scale+mask fusion | 1.038x* | 5/5 |
+| 5 | fix long_fp16 accuracy bug; chunked FFN for extreme shapes | 1.060x | 5/5 |
+| 6 | bit-exact fp16 GELU (no fp32 round-trip) | 1.072x | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -164,6 +166,49 @@ the explicit `.float()` pass: epilogue 56.09 -> 37.59 us/call (-33%).
 reduction tree does not match ATen's softmax bit-for-bit, and the resulting
 1e-5..1e-4 per-call difference compounds through the residual stream to
 max_abs 0.0078 over 6 layers — real failures. The reduction stays on ATen.
+
+### Step 5 — fix long_fp16 accuracy bug; chunked FFN for extreme shapes
+
+A 10+ shape sweep (beyond the original 5-case suite) surfaced a real accuracy
+failure at S=2048/4096 in fp16, and a separate hardware ceiling at extreme
+`ffn_dim`. Root cause of the accuracy bug: `torch.softmax(scores, dim=-1,
+dtype=torch.float32)` — the `dtype=` kwarg form — silently selects a
+**different ATen reduction kernel** than an explicit `.float()` cast followed
+by a plain softmax, and that kernel diverges by a few ulps specifically at
+long rows (not seen at S<=512 fp16, or any bf16 shape). Fix: call
+`torch.softmax()` natively on the already-model-dtype tensor — bit-identical
+to the explicit-upcast form (verified `torch.equal` up to (8,4,4096,4096) in
+both fp16/bf16), and cheaper too (no fp32 intermediate). fp16 at S=2048/4096
+now PASSES bit-exact (previously failing 6-8/524288 elements at S=2048).
+
+Separately, a grading-matrix stress case (`d_model=1024, ffn_dim=100000,
+batch=32, seq=1024`) OOMs the **unmodified reference `BaselineTransformer`**
+itself — the GELU intermediate is `[32,1024,100000]` fp32 ≈ 13.1GB, before
+`UserOptimizedTransformer` even runs. Added `ChunkedBaselineTransformer`
+(opt-in via `--chunk-baseline-ffn`, off by default, zero effect on
+`BaselineTransformer`) and matching chunked-FFN paths inside
+`UserOptimizedTransformer` (auto-triggered only when the estimated unchunked
+FFN intermediate exceeds 3GB — never for any shape in this codebase's own
+suites). Chunking is **not** automatically bit-exact even though the
+underlying math is row-independent: cuBLAS can select a different GEMM
+kernel depending on row count, the same class of bug as the softmax fix
+above, and the relationship is non-monotonic (at one tested shape, chunk
+sizes 128 and 8192+ were exact but 256-4096 were not) — so the chunk size
+used (4096) was verified bit-exact at this codebase's actual large-`ffn_dim`
+shape before use, not assumed safe by extrapolation. Result: the extreme
+case now PASSES (0/67,108,864 failed, max_abs=0.00142), 15.77x vs its
+(also chunked) eager baseline.
+
+### Step 6 — bit-exact fp16 GELU (no fp32 round-trip)
+
+The fp32 fp16-GEMM path (step 3) was upcasting the FFN's hidden activation to
+fp32 just to run GELU, then downcasting back to fp16 for the next GEMM. GELU
+follows the same pattern already found for softmax and LayerNorm: ATen's
+kernel already accumulates internally in fp32 regardless of the input
+tensor's dtype, so `F.gelu` on a fp16 tensor is bit-identical (`torch.equal`)
+to the upcast/downcast round trip — removing it costs nothing numerically
+while cutting 2 elementwise kernel launches and halving that op's memory
+traffic. `default_fp32`: 1.586x -> **1.786x** vs the compiled bar.
 
 ## 4. Rejected after measurement
 
