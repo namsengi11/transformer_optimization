@@ -1129,9 +1129,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         pieces = []
         for start in range(0, flat.shape[0], chunk_size):
             piece = flat[start : start + chunk_size]
-            hidden = F.linear(piece.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
+            # No fp32 round-trip around GELU -- see the non-chunked branch's
+            # comment; bit-identical, verified torch.equal.
+            hidden = F.linear(piece.to(torch.float16), ffn_in_weight16, ffn_in_bias16)
             hidden = F.gelu(hidden, approximate="none")
-            pieces.append(F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32))
+            pieces.append(F.linear(hidden, ffn_out_weight16, ffn_out_bias16).to(torch.float32))
         return torch.cat(pieces, dim=0).reshape(batch, seq_len, d_model)
 
     def _forward_core(
@@ -1223,9 +1225,16 @@ class UserOptimizedTransformer(BaselineTransformer):
                 ffn_out_weight16, ffn_out_bias16 = _get_linear_fp16_weights(layer.ffn_out)
                 chunk_size = self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim)
                 if chunk_size is None:
-                    hidden = F.linear(normed2.to(torch.float16), ffn_in_weight16, ffn_in_bias16).to(torch.float32)
+                    # GELU runs directly on the fp16 GEMM output, no upcast
+                    # round-trip: F.gelu on a half tensor is bit-identical to
+                    # upcast->gelu->downcast (ATen's GELU kernel already
+                    # accumulates in fp32 internally regardless of input
+                    # dtype, same as softmax/LayerNorm) -- verified
+                    # torch.equal, not just close. Removes 2 elementwise
+                    # kernel launches and halves this op's memory traffic.
+                    hidden = F.linear(normed2.to(torch.float16), ffn_in_weight16, ffn_in_bias16)
                     hidden = F.gelu(hidden, approximate="none")
-                    ffn_out = F.linear(hidden.to(torch.float16), ffn_out_weight16, ffn_out_bias16).to(torch.float32)
+                    ffn_out = F.linear(hidden, ffn_out_weight16, ffn_out_bias16).to(torch.float32)
                 else:
                     ffn_out = self._chunked_ffn_fp16gemm(
                         normed2, ffn_in_weight16, ffn_in_bias16, ffn_out_weight16, ffn_out_bias16, chunk_size
