@@ -94,6 +94,8 @@ Each step was developed on its own branch and merged only after measurement.
 | 5 | fix long_fp16 accuracy bug; chunked FFN for extreme shapes | 1.060x | 5/5 |
 | 6 | bit-exact fp16 GELU (no fp32 round-trip) | 1.072x | 5/5 |
 | 7 | investigated autotuned Triton GEMM vs cuBLAS -- **no change merged** | 1.078x (unchanged) | 5/5 |
+| 8 | fused QKV in fp16/bf16 where a probe proves it bit-exact | 1.096x | 5/5 |
+| 9 | inductor-generated layout copies (bit-exact) | **1.189x** | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -366,6 +368,126 @@ observations, not a settled root cause; the picture is still ambiguous:**
   the small remaining margin and the cost already sunk here without a
   conclusive mechanism.
 
+### Step 8 — fused QKV in fp16/bf16, gated on a bit-exactness probe
+
+Step 1 banned fused QKV in low precision outright. That was too coarse, and
+the stated reason was wrong.
+
+Measured with `torch.equal` (bit-identical, not "within tolerance") across
+10 shapes:
+
+| dtype | verdict |
+|---|---|
+| bf16 | bit-exact at **all 10** shapes |
+| fp16 | bit-exact at 8/10 — fails only at `(8,128,512)` and `(1,64,512)` |
+
+Three candidate mechanisms were checked and ruled out:
+
+* **Not kernel selection.** Profiling shows the separate (N=d_model) and
+  fused (N=3·d_model) GEMMs dispatch to the *identical* cutlass kernel
+  (`cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_tn_align8` at the
+  default shape) — same tile shape, same K-tiling.
+* **Not split-K.** Forcing `CUBLAS_WORKSPACE_CONFIG=:0:0` (no workspace, so
+  no split-K algorithms are available) leaves the exactness pattern
+  completely unchanged, and only slows the GEMMs down.
+* **Not expressible as a threshold.** Non-monotonic in M: at d_model=512
+  fp16, M=256 ✗, M=512 ✓, M=1024 ✗, M≥2048 ✓. At d_model=128 every M tried
+  was exact; at d_model=1024 the small-M end was not.
+
+What actually varies is a cuBLASLt *algorithm* choice (threadblock swizzle /
+CTA ordering) that shares one cutlass template name and is not observable or
+controllable from Python. Any hand-written `(M,K,N,dtype)` predicate would be
+curve-fitting a closed-source heuristic that a cuBLAS or driver update can
+move — the same trap as the FFN chunk-size non-monotonicity in step 5.
+
+So it is decided by measurement instead: `_probe_fused_qkv_exact` runs the
+whole forward both ways on the real input and requires `torch.equal`, once
+per configuration key, cached, before graph capture. Two extra forwards at
+warmup, nothing at steady state.
+
+**The result is narrower than the microbenchmark predicted.** Isolated, the
+fused GEMM looks worth ~230 µs/iter (20.6 → 38.2 TFLOPS at the default
+shape). In-model it is worth ~120 µs of GEMM time, because the three
+separate GEMMs get L2 reuse that a cold microbenchmark does not show. And it
+only helps at *small* M: at `big_fp16` (M=16384) the N=d_model form already
+produces 2048 tiles, plenty for 36 SMs, so fusion changes nothing there. The
+one configuration that gets both halves — M small enough for tile count to
+matter, *and* bit-exact — is bf16 at the default shape:
+
+| | main | step 8 |
+|---|---|---|
+| default_bf16 optimized median (3 reps) | 1.5284–1.5302 ms | **1.4815–1.4834 ms** (−3.1%) |
+
+Everything else unchanged within noise; still 5/5 bit-exact.
+
+### Step 9 — let inductor generate the layout copies
+
+`torch.compile` is banned everywhere else in this project because it changes
+numerics. It cannot change a rounding decision that is never made, though —
+and the q/k/v head transpose and the post-attention merge are *pure data
+movement*. Verified `torch.equal`, max_abs exactly 0, in fp16/bf16/fp32,
+alongside the neighbouring ops that fail the same test and are therefore
+deliberately left on ATen:
+
+| op under inductor | bit-exact? | fp16 max_abs |
+|---|---|---|
+| split-heads copy / merge-heads copy | **yes** | 0 |
+| residual add + masked_fill | **yes** | 0 |
+| `layer_norm` | no | 9.8e-4 |
+| fused `add + layer_norm` (what inductor prefers to emit) | no | 7.8e-3 |
+| `gelu` | no | 3.8e-6 |
+
+ATen's `direct_copy_kernel` is an elementwise kernel with 4-D index math and
+no vectorization on the strided side; at these shapes on 36 SMs it is
+launch/occupancy-bound, not bandwidth-bound. Timed **under CUDA-graph
+replay** — the way it actually runs; eager wall-clock is swamped by dynamo's
+per-call guard overhead, which graph replay removes entirely — for one
+layer's three q/k/v copies:
+
+| shape | ATen | inductor | hand-written Triton |
+|---|---|---|---|
+| B8 S128 D512 | 15.8 µs | **8.2 µs** | 9.3 µs |
+| B32 S512 D512 | 293.9 µs | **269.9 µs** | 515.7 µs |
+| B4 S2048 D512 | 154.4 µs | **130.3 µs** | 252.6 µs |
+| B16 S256 D1024 | 150.1 µs | **132.4 µs** | 253.3 µs |
+
+Inductor wins at every shape, and beats a Triton kernel hand-tuned for this
+GPU everywhere except the smallest — step 7's lesson in the opposite
+direction. Writing the kernel by hand was the wrong instinct twice now.
+
+Two traps, both worth recording:
+
+* **dynamo specializes on strides, not just shape/dtype.** With step 8's
+  fused QKV enabled, q/k/v are non-contiguous column slices of one packed
+  `[B,S,3D]` GEMM output, so a probe that passed *contiguous* tensors left a
+  second variant to be compiled later — and "later" turned out to be inside
+  `torch.cuda.graph()` capture, where that compile hit the Windows
+  static-launcher `OverflowError`, failed the capture, and permanently
+  demoted the model to the eager path. Measured: bf16 1.48 ms → **3.44 ms**,
+  while still reporting bit-exact results the whole time. The probe now
+  drives a real `_forward_core` both ways, so every variant compiles inside
+  the workaround patch, before capture is ever attempted.
+* **`use_static_cuda_launcher` is not limited to max-autotune GEMM
+  templates**, as step 7 assumed — it fires on an ordinary pointwise clone
+  too. It is patched only around the probe, never globally, so the harness's
+  own `--compile-baseline` bar keeps its normal launcher and the comparison
+  stays fair.
+
+Optimized-latency A/B (median; repetitions are non-overlapping to four
+significant figures):
+
+| case | main | step 8 | step 9 |
+|---|---|---|---|
+| default_fp32 | 1.3715 | 1.3586 | 1.3572 |
+| default_fp16 | 1.6706 | 1.6709 | **1.5395** |
+| default_bf16 | 1.5312 | 1.4835 | **1.3580** |
+| causal_fp16 | 1.6796 | 1.6803 | **1.5515** |
+| padded_fp16 | 1.7566 | 1.7576 | **1.6368** |
+| big_fp16 | 35.309 | 35.255 | **34.090** |
+| long_fp16 | 37.528 | 37.627 | **36.952** |
+| wide_fp16 | 41.102 | 40.785 | **39.635** |
+
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
@@ -375,7 +497,7 @@ observations, not a settled root cause; the picture is still ambiguous:**
 | Whole-model fp16 / bf16 cast | fp16 max_abs 0.0082, bf16 0.074 — both fail. |
 | Error-compensated fp16 (hi+lo split GEMM) | Two fp16 GEMMs cost about as much as one TF32 GEMM. No win. |
 | Folding the attention scale into `W_q`/`b_q` | 3.9e-3 divergence in fp16 (bit-exact in bf16 only). Unsafe. |
-| Fused QKV in fp16/bf16 | Changes cuBLAS kernel selection; breaks near-zero elements. |
+| ~~Fused QKV in fp16/bf16~~ | **Overturned in step 8.** Not kernel selection at all -- the fused and separate GEMMs dispatch to the *same* cutlass kernel. bf16 is bit-exact at every shape tried; fp16 at most. Now decided per-shape by a warmup `torch.equal` probe. |
 | Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. |
 | Inductor max-autotune GEMM (or a hand-written Triton GEMM) | Disabled on this GPU by inductor's SM-count gate (36 < 68 SMs); bypassed it and also hand-tuned a Triton GEMM for this exact hardware in step 7 -- cuBLAS still wins or ties at every shape this codebase actually runs. |
 
@@ -424,12 +546,18 @@ Current `default` suite:
 
 | case | speedup vs bar | MFU (ours) | MFU (compiled bar) |
 |---|---|---|---|
-| default_fp32 | 1.793x | 60.98%* | 67.19% |
-| default_fp16 | 0.894x | 49.76% | 55.63% |
-| default_bf16 | 1.170x | 53.33% | 45.58% |
-| causal_fp16 | 0.878x | 49.24% | 56.09% |
-| padded_fp16 | 0.855x | 47.06% | 55.07% |
-| **average** | **1.071x geomean** | **52.07%** | **55.91%** |
+| default_fp32 | 1.785x | 60.79%* | 67.31% |
+| default_fp16 | 0.985x | 53.60% | 54.39% |
+| default_bf16 | 1.319x | 60.02% | 45.50% |
+| causal_fp16 | 0.966x | 53.18% | 55.04% |
+| padded_fp16 | 1.059x | 50.41% | 47.58% |
+| **average** | **1.189x geomean** | **55.60%** | **53.96%** |
+
+As of step 9 the average MFU is above the compiled bar's for the first
+time. The per-case speedup column still moves several percent between
+runs -- the bar itself has ~30% cross-process variance -- so branch
+decisions are made on the *optimized* latency column, which is stable to
+four significant figures across repetitions.
 
 \* against the FP16 peak (48.8 TFLOPS), since the gate enables fp16-GEMM
 here; the bar's 67.19% is against TF32's peak (24.7 TFLOPS) since
