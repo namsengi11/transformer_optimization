@@ -339,6 +339,99 @@ def _get_fused_qkv_weights_fp16(attn: "BaselineSelfAttention") -> Tuple[torch.Te
     return w16, b16
 
 
+def _split_heads_3(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """[B, S, D] x3 -> contiguous [B, H, S, D/H] x3.
+
+    Pure data movement, so it is bit-exact by construction no matter who
+    generates the kernel -- which is what makes it safe to hand to
+    torch.compile (see _get_compiled_layout_helpers). The explicit
+    .contiguous() is not an extra copy: without it torch.matmul materializes
+    exactly the same contiguous tensors internally (the head transpose is
+    not expressible as a batched-GEMM stride, since the batch and head
+    strides are not uniform over a single flattened batch dimension)."""
+    batch, seq_len, d_model = q.shape
+    head_dim = d_model // num_heads
+    return (
+        q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2).contiguous(),
+        k.view(batch, seq_len, num_heads, head_dim).transpose(1, 2).contiguous(),
+        v.view(batch, seq_len, num_heads, head_dim).transpose(1, 2).contiguous(),
+    )
+
+
+def _merge_heads(context: torch.Tensor) -> torch.Tensor:
+    """[B, H, S, D/H] -> [B, S, D]. Pure data movement, see _split_heads_3."""
+    batch, num_heads, seq_len, head_dim = context.shape
+    return context.transpose(1, 2).reshape(batch, seq_len, num_heads * head_dim)
+
+
+# Lazily-built process-wide torch.compile'd versions of the two layout
+# helpers above. dict rather than module globals so the lazy build can be
+# reset in one place; "disabled" latches True forever after any failure.
+_COMPILED_LAYOUT: Dict[str, object] = {"split": None, "merge": None, "disabled": False}
+
+
+def _get_compiled_layout_helpers():
+    """Return (compiled_split_heads_3, compiled_merge_heads), or None.
+
+    Why torch.compile is admissible here when it is banned everywhere else
+    in this file: the two functions it compiles contain NO arithmetic at
+    all, only view/transpose/contiguous/reshape. Inductor cannot change a
+    rounding decision that is never made. Verified directly across fp16,
+    bf16 and fp32 -- `torch.equal`, max_abs exactly 0 -- alongside the ops
+    that do NOT survive the same test and are therefore deliberately left
+    on ATen: layer_norm (fp16 max_abs 9.8e-4, bf16 3.9e-3), the fused
+    add+layer_norm inductor would prefer to generate (fp16 7.8e-3 -- a full
+    ulp class, exactly the drift that makes the compiled baseline
+    non-compliant), and gelu (small but nonzero, 3.8e-6 fp16). Each callsite
+    is still probed at runtime (_resolve_compiled_layout) rather than
+    trusted.
+
+    Why bother: ATen's `direct_copy_kernel` is an elementwise kernel with
+    4-D index math and no vectorization on the strided side, and at the
+    shapes this model runs it is launch/occupancy-bound rather than
+    bandwidth-bound on a 36-SM card. Inductor emits a tiled copy instead.
+    Measured under CUDA-graph replay (which is how this actually runs -- in
+    eager wall-clock the comparison is swamped by dynamo's per-call guard
+    overhead, which graph replay removes entirely), for the three q/k/v
+    copies of one layer:
+
+        shape              ATen     inductor   hand-written Triton
+        B8  S128  D512    15.8us     8.2us          9.3us
+        B32 S512  D512   293.9us   269.9us        515.7us
+        B4  S2048 D512   154.4us   130.3us        252.6us
+        B16 S256  D1024  150.1us   132.4us        253.3us
+
+    i.e. inductor wins at every shape, and beats a hand-tuned Triton
+    kernel written specifically for this GPU everywhere except the
+    smallest shape -- the same lesson as the GEMM investigation in
+    OPTIMIZATION_LOG.md step 7, in the opposite direction.
+
+    The `use_static_cuda_launcher=False` patch is the Windows/torch-2.8 bug
+    already recorded in that step: the static launcher overflows a C long
+    with the 64-bit CUDA stream handle. It is NOT limited to max-autotune
+    GEMM templates as previously assumed -- it fires on an ordinary
+    pointwise clone too. The patch only has to be active while inductor
+    first compiles in this process (verified: later compiles of new shapes,
+    and all steady-state launches, work fine outside it), so it is scoped to
+    the one-time probe and never costs anything per call."""
+    if _COMPILED_LAYOUT["disabled"]:
+        return None
+    if _COMPILED_LAYOUT["split"] is None:
+        try:
+            _COMPILED_LAYOUT["split"] = torch.compile(
+                _split_heads_3, dynamic=False, fullgraph=True
+            )
+            _COMPILED_LAYOUT["merge"] = torch.compile(
+                _merge_heads, dynamic=False, fullgraph=True
+            )
+        except Exception:
+            _COMPILED_LAYOUT["disabled"] = True
+            return None
+    return _COMPILED_LAYOUT["split"], _COMPILED_LAYOUT["merge"]
+
+
 def _fp16_gemm_gate_thresholds() -> Tuple[float, float]:
     """Base (atol, rtol) that the fp16-GEMM calibration gate scales its
     safety margin from. Overridable via TJ_ATOL / TJ_RTOL so the gate can be
@@ -724,6 +817,13 @@ class UserOptimizedTransformer(BaselineTransformer):
         # unconditionally as part of the SDPA path.
         self._fused_qkv_exact: Dict[Tuple, bool] = {}
 
+        # (tuple(x.shape), x.dtype, x.device) -> (split_fn, merge_fn) | None.
+        # Verified-bit-exact torch.compile'd layout helpers for that
+        # configuration, or None to stay on ATen's copy kernels. `False` is
+        # used as the "not probed yet" sentinel, since None is a real
+        # verdict. See _resolve_compiled_layout.
+        self._compiled_layout_cache: Dict[Tuple, object] = {}
+
         # --- CUDA graph capture/replay state (plain attributes only: no
         # nn.Parameter, no registered buffer, so load_state_dict(strict=True)
         # is unaffected). ---
@@ -1014,6 +1114,86 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._fused_qkv_exact[key] = verdict
         return verdict
 
+    def _resolve_compiled_layout(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        mask_kind: str,
+    ):
+        """Return (split_fn, merge_fn) of torch.compile'd layout helpers to
+        use for this exact configuration, or None to stay on ATen.
+
+        Probed by running a whole forward BOTH ways and requiring
+        `torch.equal`, once per configuration key. The helpers contain no
+        arithmetic (see _get_compiled_layout_helpers), so this should always
+        pass -- it is insurance against inductor ever fusing something
+        unexpected into a copy, not a tolerance gate.
+
+        Probing with a real forward rather than with synthetic tensors is
+        load-bearing, and was found the hard way. dynamo specializes on
+        *strides*, not just shape/dtype, and the tensors these helpers
+        actually receive are not always contiguous: with fused QKV enabled,
+        q/k/v are non-contiguous column slices of one packed [B, S, 3*D]
+        GEMM output. A probe that passed contiguous tensors therefore left a
+        second variant to be compiled later -- and "later" turned out to be
+        *inside torch.cuda.graph() capture*, where that compile hit the
+        Windows static-launcher OverflowError, failed the capture, and
+        permanently demoted the model to the eager path (measured: bf16
+        1.48ms -> 3.44ms, i.e. this optimization made things 2.3x worse
+        while still reporting bit-exact results). Driving the probe through
+        _forward_core with the real flags compiles every variant the steady
+        state will use, inside the workaround patch, before capture is ever
+        attempted.
+
+        Like every other probe in this class, this syncs and compiles, so it
+        must run before CUDA graph capture, never inside a captured region."""
+        if x.device.type != "cuda" or torch.compiler.is_compiling():
+            return None
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind,
+               use_fp16_gemm, use_fused_qkv)
+        cached = self._compiled_layout_cache.get(key, False)
+        if cached is not False:
+            return cached
+
+        verdict = None
+        helpers = _get_compiled_layout_helpers()
+        if helpers is not None:
+            try:
+                with torch.inference_mode():
+                    reference = self._forward_core(
+                        x, valid_token_mask, mask_active, causal,
+                        use_sdpa, use_fp16_gemm, use_fused_qkv, layout=None,
+                    )
+                    with torch._inductor.config.patch(use_static_cuda_launcher=False):
+                        candidate = self._forward_core(
+                            x, valid_token_mask, mask_active, causal,
+                            use_sdpa, use_fp16_gemm, use_fused_qkv, layout=helpers,
+                        )
+                if bool(torch.equal(reference, candidate)):
+                    verdict = helpers
+            except Exception:
+                # Compile/launch failure (no triton, or the Windows
+                # static-launcher bug surfacing somewhere the patch above
+                # doesn't reach). Never retry in this process; ATen still
+                # produces correct results, only slower.
+                _COMPILED_LAYOUT["disabled"] = True
+                verdict = None
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            print(
+                f"[compiled-layout] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"fused_qkv={use_fused_qkv} sdpa={use_sdpa} -> "
+                f"{'ENABLE' if verdict is not None else 'DISABLE (ATen copies)'}",
+                file=sys.stderr,
+            )
+        self._compiled_layout_cache[key] = verdict
+        return verdict
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1041,27 +1221,33 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_fused_qkv = self._resolve_fused_qkv_enabled(
             x, valid_token_mask, mask_active, causal, use_sdpa, mask_kind
         )
+        # Compiles inductor kernels and syncs on its verification compare,
+        # so likewise resolved here, outside any captured region.
+        layout = self._resolve_compiled_layout(
+            x, valid_token_mask, mask_active, causal, use_sdpa,
+            use_fp16_gemm, use_fused_qkv, mask_kind,
+        )
 
         if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, mask_kind)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -1090,6 +1276,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_sdpa: bool,
         use_fp16_gemm: bool,
         use_fused_qkv: bool,
+        layout,
         mask_kind: str,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
@@ -1106,12 +1293,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
+                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout)
         torch.cuda.current_stream().wait_stream(warmup_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
+            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -1269,6 +1456,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_sdpa: bool,
         use_fp16_gemm: bool = False,
         use_fused_qkv: bool = False,
+        layout=None,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
@@ -1344,7 +1532,10 @@ class UserOptimizedTransformer(BaselineTransformer):
                     is_causal=is_causal,
                     scale=attn.scale,
                 )
-                context16 = context16.transpose(1, 2).reshape(batch, seq_len, d_model)
+                context16 = (
+                    layout[1](context16) if layout is not None
+                    else context16.transpose(1, 2).reshape(batch, seq_len, d_model)
+                )
 
                 out_weight16, out_bias16 = _get_linear_fp16_weights(attn.out_proj)
                 attn_out = F.linear(context16, out_weight16, out_bias16).to(torch.float32)
@@ -1409,9 +1600,19 @@ class UserOptimizedTransformer(BaselineTransformer):
                 k = attn.k_proj(normed)
                 v = attn.v_proj(normed)
 
-            q = q.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
-            k = k.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
-            v = v.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+            if layout is not None and not use_sdpa:
+                # Manual-math path only. The head transpose has to be
+                # materialized here either way (torch.matmul would do it
+                # internally); `layout[0]` just does it with inductor's tiled
+                # copy instead of ATen's strided elementwise one. NOT applied
+                # on the SDPA path, where the mem-efficient backend consumes
+                # the strided views directly and forcing them contiguous
+                # would ADD copies rather than speed them up.
+                q, k, v = layout[0](q, k, v, attn.num_heads)
+            else:
+                q = q.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+                k = k.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+                v = v.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
 
             if use_sdpa:
                 context = F.scaled_dot_product_attention(
@@ -1435,7 +1636,10 @@ class UserOptimizedTransformer(BaselineTransformer):
                 )
                 context = torch.matmul(probs, v)
 
-            context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
+            context = (
+                layout[1](context) if layout is not None
+                else context.transpose(1, 2).reshape(batch, seq_len, d_model)
+            )
             attn_out = attn.out_proj(context)
             if mask_active:
                 attn_out = attn_out.masked_fill(invalid_mask, 0)
