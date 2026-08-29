@@ -543,16 +543,24 @@ class UserOptimizedTransformer(BaselineTransformer):
     dtype changes / custom kernels):
       1. Fused QKV projection: q_proj/k_proj/v_proj weights+biases are
          packed into one [3*d_model, d_model] matrix per layer so a single
-         GEMM replaces three, on the fp32/SDPA path (see (2)). out_proj and
-         the FFN GEMMs stay separate. On the fp16/bf16 path the fusion is
-         deliberately NOT used: verified directly (by diffing q/k/v from the
-         fused GEMM against attn.q_proj/k_proj/v_proj on identical inputs)
-         that packing q/k/v into one wider GEMM makes cuBLAS pick a
-         different fp16 reduction/tiling than three separate d_model-wide
-         GEMMs, which is a genuine (if small, ~1-ulp-class) source of
-         divergence from the baseline -- unacceptable given bit-exactness
-         is the explicit goal at fp16/bf16. fp32 has enough mantissa
-         headroom that the same effect stays within tolerance there.
+         GEMM replaces three. out_proj and the FFN GEMMs stay separate.
+         Worth ~1.9x on those GEMMs (measured 20.6 -> 38.2 TFLOPS in fp16
+         at the default shape): N=3*d_model yields three times the
+         threadblock tiles, which matters a lot on a 36-SM card where the
+         narrow N=d_model form leaves SMs idle.
+         On the fp32/SDPA path (see (2)) it is used unconditionally -- fp32
+         has the mantissa headroom to absorb any reassociation.
+         On the fp16/bf16 path it is used only where a warmup probe proved
+         it BIT-EXACT for that exact configuration (_probe_fused_qkv_exact:
+         run the whole forward both ways, require torch.equal), falling
+         back to three separate GEMMs otherwise. This replaces an earlier
+         blanket "never fuse in low precision" rule, which was both too
+         conservative (bf16 is bit-exact at every shape tried, and so is
+         fp16 at most of them) and based on a wrong mechanism -- the fused
+         and separate GEMMs dispatch to the *same* cutlass kernel; what
+         varies is an unqueryable cuBLASLt algorithm choice that is
+         non-monotonic in M and unaffected by the split-K workspace knob.
+         See _probe_fused_qkv_exact's docstring for the measurements.
       2. Dtype-dependent attention implementation, chosen lazily from the
          model's compute dtype and cached until the dtype changes:
            - fp32: F.scaled_dot_product_attention, letting a fused SDPA
@@ -706,6 +714,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         # never enter this dict -- _resolve_fp16_gemm_enabled short-circuits
         # to False for them).
         self._fp16_gemm_gate: Dict[Tuple, bool] = {}
+
+        # (tuple(x.shape), x.dtype, x.device, causal, mask_kind) -> bool.
+        # Verdict of whether the fused-QKV GEMM is BIT-EXACT (torch.equal on
+        # the whole forward output, not merely within tolerance) against the
+        # three separate projections for that configuration, on the fp16/bf16
+        # manual-math path -- see _probe_fused_qkv_exact and class docstring
+        # item 1. Never populated for fp32 models, which fuse QKV
+        # unconditionally as part of the SDPA path.
+        self._fused_qkv_exact: Dict[Tuple, bool] = {}
 
         # --- CUDA graph capture/replay state (plain attributes only: no
         # nn.Parameter, no registered buffer, so load_state_dict(strict=True)
@@ -896,6 +913,107 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._fp16_gemm_gate[key] = verdict
         return verdict
 
+    def _probe_fused_qkv_exact(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+    ) -> bool:
+        """Decide whether the fused-QKV GEMM may be used on the fp16/bf16
+        manual-math path, by running the whole forward BOTH ways on this
+        configuration's real first-forward input and requiring
+        `torch.equal` -- bit-identical output, not "within tolerance".
+
+        Why this is a runtime probe and not a static condition. Packing
+        q/k/v into one [3*d_model, d_model] GEMM changes nothing
+        mathematically, and on this hardware it is bit-exact for **every**
+        bf16 shape tried and for most fp16 shapes -- but not all of them.
+        The reason is NOT the "different cuBLAS kernel selection" this
+        docstring used to claim: profiling shows the separate (N=d_model)
+        and fused (N=3*d_model) GEMMs dispatch to the *identical* cutlass
+        kernel (`cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_
+        tn_align8` at the default shape), so the tile shape and K-tiling
+        are the same. What differs is a cuBLASLt *algorithm* choice
+        (threadblock swizzle / CTA ordering) that shares one cutlass
+        template name and is not observable or controllable from Python:
+          - it was NOT split-K driven -- forcing `CUBLAS_WORKSPACE_CONFIG=
+            :0:0` (no workspace, so no split-K algorithms) leaves the
+            exactness pattern completely unchanged, and only slows the
+            GEMMs down.
+          - it is NOT monotonic in M, so it cannot be captured by a
+            threshold. Measured at d_model=512, fp16, M = batch*seq_len:
+            M=256 inexact, M=512 exact, M=1024 inexact, M=2048/4096/8192/
+            16384 exact. At d_model=128 every M tried was exact; at
+            d_model=1024 the small-M end was inexact.
+        This is the same class of trap as the FFN chunk-size
+        non-monotonicity documented on ChunkedBaselineTransformerBlock: any
+        hand-written (M, K, N, dtype) predicate would be curve-fitting a
+        closed-source heuristic that a cuBLAS or driver update can move.
+        Measuring the actual answer for the actual configuration is both
+        cheaper to maintain and strictly safer.
+
+        Cost is two extra forwards, ONCE per configuration key at warmup
+        (then cached in _fused_qkv_exact) -- the same shape of cost as
+        _calibrate_fp16_gemm, and nothing at steady state. Like that
+        calibration, this is a device->host sync and must run before any
+        CUDA graph capture, never inside a captured region.
+
+        Comparing the whole forward output (rather than one layer's q/k/v)
+        is deliberate: every layer's projection input differs, so a
+        per-layer spot check on a single layer's weights could pass by luck
+        while another layer diverges. Any divergence anywhere reaches the
+        output, so `torch.equal` on the output is the strictly stronger
+        check.
+        """
+        with torch.inference_mode():
+            separate = self._forward_core(
+                x, valid_token_mask, mask_active, causal,
+                use_sdpa=False, use_fp16_gemm=False, use_fused_qkv=False,
+            )
+            fused = self._forward_core(
+                x, valid_token_mask, mask_active, causal,
+                use_sdpa=False, use_fp16_gemm=False, use_fused_qkv=True,
+            )
+        passed = bool(torch.equal(separate, fused))
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            n_diff = int((separate != fused).sum().item())
+            print(
+                f"[fused-qkv-probe] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"causal={causal} mask_active={mask_active} "
+                f"differing={n_diff}/{separate.numel()} -> "
+                f"{'ENABLE' if passed else 'DISABLE (keep 3 separate GEMMs)'} fused-QKV",
+                file=sys.stderr,
+            )
+        return passed
+
+    def _resolve_fused_qkv_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        mask_kind: str,
+    ) -> bool:
+        """Gate for the fp16/bf16 fused-QKV GEMM. Returns False for the
+        fp32/SDPA path (which already fuses QKV unconditionally -- fusion
+        there is driven by `use_sdpa`, not by this flag) and off CUDA (where
+        the cuBLAS kernel-selection effect this probes for does not apply and
+        the extra probe forwards would just be overhead). Otherwise probes
+        once per configuration key and caches the verdict -- see
+        _probe_fused_qkv_exact."""
+        if use_sdpa or x.device.type != "cuda":
+            return False
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind)
+        cached = self._fused_qkv_exact.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._probe_fused_qkv_exact(x, valid_token_mask, mask_active, causal)
+        self._fused_qkv_exact[key] = verdict
+        return verdict
+
     def forward(
         self,
         x: torch.Tensor,
@@ -918,27 +1036,32 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_fp16_gemm = self._resolve_fp16_gemm_enabled(
             x, valid_token_mask, mask_active, causal, use_sdpa, mask_kind
         )
+        # Also a device->host sync (torch.equal), for the same reason, so it
+        # likewise has to be resolved here rather than inside _forward_core.
+        use_fused_qkv = self._resolve_fused_qkv_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, mask_kind
+        )
 
         if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, mask_kind)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, mask_kind)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -966,6 +1089,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         causal: bool,
         use_sdpa: bool,
         use_fp16_gemm: bool,
+        use_fused_qkv: bool,
         mask_kind: str,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
@@ -982,12 +1106,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
         torch.cuda.current_stream().wait_stream(warmup_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm)
+            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -1144,6 +1268,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         causal: bool,
         use_sdpa: bool,
         use_fp16_gemm: bool = False,
+        use_fused_qkv: bool = False,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
@@ -1157,7 +1282,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         straight back to fp32, while LayerNorm/GELU/residual adds/final norm
         stay fp32. It is only ever True when use_sdpa is also True (that
         combination is fp32-exclusive); the fp16/bf16 manual-math branch
-        below is completely unaffected by it."""
+        below is completely unaffected by it.
+
+        `use_fused_qkv` (fp16/bf16 manual-math path only -- see
+        _resolve_fused_qkv_enabled) replaces the three separate q/k/v
+        projection GEMMs with one packed [3*d_model, d_model] GEMM. It is
+        only ever True when the probe proved that substitution BIT-EXACT
+        (torch.equal on the whole forward output) for this exact
+        configuration; on the fp32/SDPA path QKV is fused unconditionally
+        and this flag stays False."""
         batch, seq_len, d_model = x.shape
 
         invalid_mask: Optional[torch.Tensor] = None
@@ -1245,22 +1378,33 @@ class UserOptimizedTransformer(BaselineTransformer):
                     x = x.masked_fill(invalid_mask, 0)
                 continue
 
-            if use_sdpa:
-                # Fused QKV GEMM: fp16/fp32/bf16-safe *mathematically*, but
-                # verified (empirically, on this cuBLAS/hardware combo) to
-                # select a different fp16 reduction/tiling than three
-                # separate GEMMs of width d_model each, which can shift a
-                # handful of near-zero elements past atol after several
-                # layers. Harmless in fp32 -- the only path that uses it --
-                # since fp32 has enough mantissa headroom to absorb it.
+            if use_sdpa or use_fused_qkv:
+                # One packed [3*d_model, d_model] GEMM instead of three
+                # d_model-wide ones. Mathematically identical, and measured
+                # ~1.9x the throughput of the three separate GEMMs at the
+                # default shape (20.6 -> 38.2 TFLOPS in fp16), because
+                # N=3*d_model gives 3x the threadblock tiles to spread over
+                # this card's 36 SMs.
+                #
+                # It is NOT unconditionally bit-exact in low precision,
+                # though: cuBLASLt picks a different internal algorithm
+                # (same cutlass kernel, different CTA ordering) for some
+                # (M, K, N, dtype) combinations, which reorders the fp32
+                # accumulation and shifts near-zero elements by an ulp. On
+                # the fp32/SDPA path (use_sdpa) that is harmless -- fp32 has
+                # the mantissa headroom -- so fusion is unconditional there.
+                # On the fp16/bf16 path it is used only where
+                # _probe_fused_qkv_exact proved bit-exactness for this exact
+                # configuration; otherwise use_fused_qkv is False and the
+                # three-GEMM branch below runs instead.
                 fused_weight, fused_bias = _get_fused_qkv_weights(attn)
                 qkv = F.linear(normed, fused_weight, fused_bias)
                 q, k, v = qkv.split(d_model, dim=-1)
             else:
-                # fp16/bf16: skip the fused GEMM and issue the same three
-                # separate GEMMs the baseline uses, so the matmul reduction
-                # order -- and thus the fp16/bf16 rounding -- matches
-                # bit-for-bit instead of merely "close enough".
+                # fp16/bf16 where fusion was NOT proved bit-exact: issue the
+                # same three separate GEMMs the baseline uses, so the matmul
+                # reduction order -- and thus the fp16/bf16 rounding --
+                # matches bit-for-bit instead of merely "close enough".
                 q = attn.q_proj(normed)
                 k = attn.k_proj(normed)
                 v = attn.v_proj(normed)
