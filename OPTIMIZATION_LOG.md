@@ -321,6 +321,51 @@ payoff that isn't there at the shape that matters. `_resolve_fp16_gemm_enabled`'
 existing cuBLAS fp16-GEMM path (step 3) remains the fastest fp32 GEMM path
 found on this hardware.
 
+**Follow-up `ncu` observations (post-elevation access) — logged as
+observations, not a settled root cause; the picture is still ambiguous:**
+
+- Achieved occupancy (`sm__warps_active`) on the real cutlass GEMM/attention
+  kernels is genuinely low: 8-16% for the two GEMM tile variants, 14.7-14.8%
+  for `fmha_cutlassF`, versus 70-84% for LayerNorm/GELU/residual-add.
+  `occupancy_limit_shared_mem` caps them at 1-2 resident blocks/SM (of 24
+  possible). One narrow-N shape (`out_proj`/`ffn_out`, grid=32) has *fewer
+  blocks than SMs* -- some SMs get zero work for that kernel's duration.
+- A hand-written Triton GEMM re-tuned for `out_proj`'s exact shape (32x64x32
+  tile, 256 blocks -- well above 36 SMs) reached 33.2% occupancy, more than
+  2x cuBLAS's 15.1% at that shape -- and was still ~3.4% *slower* (20.29us
+  vs 18.69us), with slightly lower SM throughput (32.45% vs 34.29%).
+  Confirms occupancy alone isn't the limiter for these kernels; higher
+  occupancy did not translate to a win.
+- Initial diagnosis pinned this on shared-memory bank conflicts (broad
+  `l1tex__data_bank_conflicts_pipe_lsu.sum`: 15,479 Triton vs 5,741 cuBLAS,
+  ~2.7x). **That diagnosis does not hold up**: the shared-memory-*specific*
+  counters (`..._mem_shared_op_ld/st.sum`) are actually comparable --
+  4,651 (Triton) vs 5,116 (cuBLAS) -- so the broad metric was picking up
+  something else (likely global-memory-related LSU-pipe replay activity,
+  not shared-memory bank conflicts specifically). Retracting that claim.
+- What *is* different: shared-memory load wavefronts are ~40% higher for
+  Triton (404,361 vs 289,238) while store wavefronts are ~48% lower (9,890
+  vs 18,982). Read as circumstantial evidence that cuBLAS's `s16816gemm`
+  kernel (named for the `mma.sync.m16n8k16` instruction) moves tensor-core
+  operands via wider/fewer shared-memory-to-register instructions
+  (`ldmatrix`-style) than Triton's generic `tl.dot` lowering -- but this is
+  an inference from wavefront counts, not a confirmed instruction-level
+  cause (no SASS-level comparison was done). Global-memory coalescing is
+  identical between the two (16 sectors/request, both ld and st) and is
+  ruled out as a factor.
+- Tested directly: shrinking the GEMM's M dimension (simulating "process a
+  smaller chunk of the batch at a time") does **not** help and does not
+  scale as a clean per-tile-constant story either -- M=256 (64 blocks)
+  measured *worse* per-output-element time than M=1024 (256 blocks), with
+  occupancy dropping from 33.4% to 13.9%. Smaller batches just reduce the
+  already-thin margin of blocks-vs-36-SMs further; they don't touch
+  whatever the real per-tile inefficiency is.
+- Net: cuBLAS is beaten by only ~3.4% at the one shape with the largest
+  gap after a real config search, and the exact instruction-level reason
+  remains unconfirmed. Not worth further kernel-engineering effort given
+  the small remaining margin and the cost already sunk here without a
+  conclusive mechanism.
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
