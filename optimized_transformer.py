@@ -35,6 +35,7 @@ import torch._inductor.config as _icfg
 
 from benchmark import BaselineTransformer, TransformerConfig
 from minseok_flash_attn import flash_attention
+from minseok_fused_ffn import fused_ffn
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -52,6 +53,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._compiled = None
         self._graphs = {}      # (shape, dtype) -> captured bundle
         self._mask_cache = (None, True)  # (id(mask), no_pad) — avoids a per-call sync
+        # Big-FFN configs (e.g. ffn_dim=100000) route to the fused streaming FFN
+        # kernel, which never materializes the [M,ffn] hidden. That kernel is a
+        # Triton op (breaks torch.compile), so these run eager — they are
+        # compute-bound, so the CUDA graph a compiled path would add is not the win.
+        c = config
+        self._big_ffn = c.batch_size * c.seq_len * c.ffn_dim * 2 > FFN_CHUNK_BYTES
         # Flash is an opt-in EAGER path for long sequences (MINSEOK_FLASH=1).
         # It is not in the default shipping path: manual CUDA-graph capture of a
         # forward containing the flash kernel + cublasLt GEMMs is unstable at
@@ -60,26 +67,18 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._use_flash = (config.seq_len >= FLASH_MIN_SEQ
                            and os.environ.get("MINSEOK_FLASH") == "1")
 
-    # ---- FFN with optional row chunking (for extreme ffn_dim) ----
-    def _ffn_chunk_rows(self, blk, h_flat) -> int:
-        rows, ffn = h_flat.shape[0], blk.ffn_in.out_features
-        per_row = ffn * h_flat.element_size()
-        if rows * per_row <= FFN_CHUNK_BYTES:
-            return rows
-        return max(1, FFN_CHUNK_BYTES // per_row)
-
+    # ---- FFN: fused streaming kernel when the hidden would be large, else plain ----
     def _ffn(self, blk, h):
         B, S, D = h.shape
         hf = h.reshape(B * S, D)
-        chunk = self._ffn_chunk_rows(blk, hf)
-        if chunk >= hf.shape[0]:
-            out = blk.ffn_out(F.gelu(blk.ffn_in(hf), approximate="none"))
+        per_row = blk.ffn_in.out_features * 2  # fp16 hidden bytes per row
+        if hf.shape[0] * per_row > FFN_CHUNK_BYTES:
+            # fused streaming FFN: hidden [M,ffn] never materialized (fixes OOM)
+            out = fused_ffn(hf, blk.ffn_in.weight, blk.ffn_in.bias,
+                            blk.ffn_out.weight, blk.ffn_out.bias)
         else:
-            out = torch.empty_like(hf)
-            for i in range(0, hf.shape[0], chunk):
-                s = slice(i, i + chunk)
-                out[s] = blk.ffn_out(F.gelu(blk.ffn_in(hf[s]), approximate="none"))
-        return out.reshape(B, S, D)
+            out = blk.ffn_out(F.gelu(blk.ffn_in(hf), approximate="none"))
+        return out.reshape(B, S, D).to(h.dtype)
 
     # ---- optimized fp32 forward, reusing the baseline submodules' weights ----
     def _forward_core(self, x, use_autocast=True):
@@ -169,9 +168,10 @@ class UserOptimizedTransformer(BaselineTransformer):
     def forward(self, x, valid_token_mask=None):
         cfg_ok = x.is_cuda and self._no_pad(valid_token_mask)
         if x.dtype == torch.float32 and cfg_ok:
-            if self._use_flash:
-                # eager flash (no capture) — the long-seq rows are compute-bound,
-                # so the launch overhead a graph would remove is negligible here.
+            if self._use_flash or self._big_ffn:
+                # eager path: the flash kernel and the fused FFN kernel are Triton
+                # ops that break torch.compile; these configs are compute-bound so
+                # the CUDA graph a compiled path would add is not the win.
                 return self._forward_core(x)
             if self._compiled is None:
                 self._compiled = self._pick_and_compile(x)

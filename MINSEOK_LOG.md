@@ -24,7 +24,8 @@ combined strategy, and the measured results.
   **separate subprocesses** (a single `torch.compile` per process — two CUDA-graph
   compiles in one process corrupt each other's graphs). Median of 60 timed iters after
   20 warmup. Files: `optimized_transformer.py` (model), `benchmark.py` (harness, given),
-  `run_matrix.py` (runner), `minseok_flash_attn.py` (flash kernel).
+  `run_matrix.py` (runner), `minseok_flash_attn.py` (flash kernel),
+  `minseok_fused_ffn.py` (fused streaming FFN kernel).
 
 ---
 
@@ -50,8 +51,12 @@ the harness weight-copy works. For fp32 CUDA input with no padding:
    score-matrix + fp32-softmax path.
 5. **Mask-triviality memoization**: `bool(mask.all())` is a GPU->CPU sync that would run
    every call and defeat the CUDA graph; it is cached per mask tensor (syncs at most once).
-6. **Chunked FFN** when the GELU intermediate would exceed ~2 GB (the ffn_dim=100000 row),
-   row-chunked so peak memory stays bounded.
+6. **Fused streaming FFN** (`minseok_fused_ffn.py`) when the hidden `[M,ffn]` would
+   exceed ~2 GB (the ffn_dim=100000 row): a Triton kernel that streams the hidden
+   dimension and accumulates the output directly, so the hidden is **never
+   materialized** (memory O(M*D), not O(M*ffn)). This removes both the OOM and the
+   hidden's HBM traffic. Big-FFN configs run eager (the kernel breaks torch.compile;
+   they are compute-bound, so no CUDA-graph loss).
 7. **Opt-in eager flash-attention** (`MINSEOK_FLASH=1`, `minseok_flash_attn.py`) for
    seq>=512: a transpose-free `[B,S,H,hd]->[B,S,D]` Triton kernel, avoiding the
    score-matrix materialization and head-reshape copies SDPA forces. Kept opt-in because
@@ -102,6 +107,23 @@ Reading the results honestly:
 - **06 and 14 could not be measured**: the *reference baseline itself* exceeds 8 GB
   (config 14's FFN intermediate is ~12 GB fp32) before the optimized model runs. The
   chunked-FFN path handles 14 given enough memory; both need the 16 GB grading GPU.
+
+### Fused streaming FFN — the `14_extreme` OOM fix (measured)
+
+`python minseok_fused_ffn.py` (kernel vs a reference FFN, Ada). Accuracy passes
+everywhere (abs 1.4–1.6e-3) and the memory advantage grows with `ffn`:
+
+| shape (M, D, ffn) | hidden if materialized | fused peak | ref peak |
+|---|---|---|---|
+| 8192, 512, 8192 | 128 MB | 146 MB | 642 MB (4.4×) |
+| **32768, 1024, 100000** (`14`'s FFN) | **6.1 GB** | **1.26 GB** | OOM at 6.1 GB |
+
+The `14_extreme` FFN — which OOMs the reference baseline itself — **runs on the 8 GB
+dev card** through the fused kernel (peak 1.26 GB, PASS abs 1.63e-3). Wired into the
+model (`_big_ffn` routes to it), end-to-end accuracy on a forced-fused config PASSES
+(max abs 9.7e-4). On the 16 GB grading GPU this makes `14_extreme` runnable where the
+baseline cannot allocate its hidden; validate the full-model `14` there (its attention
+scores also need the larger card).
 
 ### Flash-attention (opt-in) — measured separately
 
