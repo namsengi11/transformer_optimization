@@ -96,6 +96,7 @@ Each step was developed on its own branch and merged only after measurement.
 | 7 | investigated autotuned Triton GEMM vs cuBLAS -- **no change merged** | 1.078x (unchanged) | 5/5 |
 | 8 | fused QKV in fp16/bf16 where a probe proves it bit-exact | 1.096x | 5/5 |
 | 9 | inductor-generated layout copies (bit-exact) | **1.189x** | 5/5 |
+| 10 | investigated fp8 weight quantization -- **no change merged** | 1.189x (unchanged) | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -488,6 +489,164 @@ significant figures):
 | wide_fp16 | 41.102 | 40.785 | **39.635** |
 
 
+### Step 10 — investigated: fp8 weight quantization (no change merged)
+
+Question: can less-sensitive weights go to fp8 (e4m3) with fine-grained
+group scales, staying close to the fp32 reference? Measured end to end.
+Answer: **no, nowhere in this model** — and it fails on two independent
+axes, either of which alone is disqualifying.
+
+**Platform support first** (torch 2.8 / sm_120, `torch._scaled_mm`):
+
+| scale granularity | supported? |
+|---|---|
+| per-tensor scalar | yes |
+| per-row / per-channel | **no** — `Per-row scaling is not supported for this platform!` |
+| MX block-scaled, e8m0, block=32 | **yes** (block=128 rejected; 32 is the only valid block) |
+| `out_dtype` fp16 / bf16 / fp32 | all yes |
+| fused bias | fp16/bf16 out only — *not* with fp32 out |
+
+So the "fine-grained group scale" form is available, but only as MX
+(`float8_e8m0fnu` scales, one per 32 elements along K). e8m0 scales are
+powers of two, so the scaling itself contributes **no** rounding error;
+all error is e4m3 mantissa truncation.
+
+**Trap worth recording: the MX scale tensor must be in a 128x4 swizzled
+layout, and passing a linear `[rows, K/32]` layout does not raise — it
+silently returns wrong numbers.** A linear layout measured `err/std =
+0.412` against an fp32 matmul; the same data in the swizzled layout gives
+`0.0299`, which is exactly e4m3's expected round-trip error. The shape
+check passes either way, so this reads as "fp8 is inaccurate" rather than
+"the layout is wrong" unless it is checked against a reference.
+
+**Measurement 1 — fp8 GEMM ceiling.** The raw hardware win is real and
+large (best-of-3, `torch.cuda.Event`, 25 warmup + 100 iters, at the shapes
+this codebase runs):
+
+| shape (MxKxN) | fp16 ms | fp8/per-tensor ms | mxfp8 ms | mxfp8 TFLOPS | mx vs fp16 |
+|---|---|---|---|---|---|
+| qkv_fused default (1024x512x1536) | 0.0405 | 0.0232 | 0.0172 | 93.5 | 2.35x |
+| out_proj default (1024x512x512) | 0.0248 | 0.0150 | 0.0149 | 36.0 | 1.66x |
+| ffn_in default (1024x512x2048) | 0.0525 | 0.0306 | 0.0224 | 95.9 | 2.34x |
+| ffn_out default (1024x2048x512) | 0.0537 | 0.0307 | 0.0191 | 112.7 | 2.81x |
+| qkv_fused big (16384x512x1536) | 0.5588 | 0.2982 | 0.2104 | 122.5 | 2.66x |
+| ffn_in big (16384x512x2048) | 0.7875 | 0.4022 | 0.2829 | 121.5 | 2.78x |
+| ffn_out big (16384x2048x512) | 0.7446 | 0.3701 | 0.2422 | 141.8 | 3.07x |
+| ffn_in wide (4096x1024x4096) | 0.7548 | 0.3769 | 0.2468 | 139.2 | 3.06x |
+| ffn_out wide (4096x4096x1024) | 0.7774 | 0.3694 | 0.2339 | 146.9 | 3.32x |
+
+mxfp8 peaks at ~147 TFLOPS against the measured fp16 peak of 48.8 (§5b),
+the expected ~3x tensor-core generation ratio — and MX is *faster* than
+per-tensor fp8, i.e. sm_120 has native block-scaled MMA rather than
+emulating it. This is the largest single GEMM lever this project has
+measured. Both other axes kill it anyway.
+
+**Measurement 2 — weight distributions, and why group scaling is inert
+here.** Default config, layer 0:
+
+| matrix | numel | absmax | std | per-32-block amax min/med/max |
+|---|---|---|---|---|
+| q/k/v/out_proj | 262144 | 0.0442 | 0.0255 | 0.0332 / 0.0432 / 0.0442 |
+| ffn_in | 1048576 | 0.0442 | 0.0255 | 0.0322 / 0.0433 / 0.0442 |
+| ffn_out | 1048576 | 0.0221 | 0.0128 | 0.0158 / 0.0216 / 0.0221 |
+
+The total spread of block maxima is ~1.37x. Group scaling exists to isolate
+**outliers** — and there are none, because these are default `nn.Linear`
+uniform-init weights, not trained ones. Weight round-trip relative RMS
+error is therefore *identical to four decimal places* at every granularity:
+
+| granularity | per-tensor | block=256 | block=128 | block=64 | block=32 |
+|---|---|---|---|---|---|
+| rel_rms | 0.02714 | 0.02714 | 0.02714 | 0.02714 | 0.02714 |
+
+(fp16, for contrast: 0.000217 — 125x better.) **The finer granularity buys
+literally nothing on this model.** The error is mantissa width, and no
+scale layout fixes a 3-bit mantissa. This is a property of the benchmark's
+untrained weights; on a real trained model with outlier channels, group
+scaling would matter a great deal — but the wall below would still bind.
+
+**Measurement 3 — the hard accuracy wall.** e4m3's own relative precision
+(rel_rms **2.71%**) is *larger than the harness's rtol* (**2%**), before a
+single layer of compounding. A format whose inherent error exceeds the
+tolerance cannot be placed anywhere. End-to-end vs the fp32 eager baseline
+at the default shape, harness criterion (`|err|<=0.002 OR rel<=0.02`, zero
+failures required):
+
+| weights quantized | mode | failed / 524288 | max_abs | verdict |
+|---|---|---|---|---|
+| all (current fast path) | **fp16** | **0** | **0.00129** | **PASS** |
+| ffn_in+ffn_out | weight-only, fp32 GEMM | 239991 | 0.0803 | FAIL |
+| ffn_in only | weight-only, fp32 GEMM | 185123 | 0.0587 | FAIL |
+| ffn_out only | weight-only, fp32 GEMM | 182513 | 0.0566 | FAIL |
+| out_proj only | weight-only, fp32 GEMM | 51678 | 0.0155 | FAIL |
+| v_proj only | weight-only, fp32 GEMM | 51464 | 0.0161 | FAIL |
+| all | mxfp8 (both operands) | 301518 | 0.1251 | FAIL |
+
+Pushed to the most favorable case that exists — **one matrix, in one
+layer, weight-only, with the GEMM itself still exact fp32** (strictly the
+least damage an fp8 weight can do):
+
+| layer | matrix | failed / 524288 | max_abs | verdict |
+|---|---|---|---|---|
+| L0 | attn.v_proj | 3186 | 0.00458 | FAIL |
+| L0 | attn.out_proj | 4317 | 0.00515 | FAIL |
+| L0 | ffn_in | 82198 | 0.0250 | FAIL |
+| L0 | ffn_out | 81414 | 0.0266 | FAIL |
+| L5 | attn.v_proj | 15065 | 0.00857 | FAIL |
+| L5 | ffn_in | 74393 | 0.0238 | FAIL |
+
+The gentlest possible application still lands at 2.3x the atol. Meanwhile
+fp16 across **every** matrix in **every** layer uses only 64% of the atol
+budget. There is no subset with headroom — the gap is a factor of ~3.5 at
+the very best, not a few percent to be tuned away.
+
+**Measurement 4 — even ignoring accuracy, it would be slower.** The GEMM
+speedup is real but the operands have to get *into* fp8. Weights are
+pre-quantized once and cached (the `_get_linear_fp16_weights` pattern), so
+only activations are quantized per call — an amax reduction over each
+32-element block, `log2`/`ceil`/`exp2`, a divide, a cast, and the 128x4
+scale swizzle:
+
+| shape | fp16 linear | fp8 GEMM alone | fp8 + activation quant | net |
+|---|---|---|---|---|
+| ffn_in default | 0.0526 | 0.0241 | 0.1991 | **0.26x** |
+| ffn_out default | 0.0536 | 0.0190 | 0.1887 | **0.28x** |
+| ffn_in big | 0.7470 | 0.2866 | 0.9067 | **0.82x** |
+| ffn_out big | 0.7127 | 0.2490 | 2.8688 | **0.25x** |
+
+Quantization costs 4-8x what the GEMM saves: fp8 is **3.5-4x slower than
+the existing fp16 path** end to end at the default shape. (This quantizer
+is straightforward PyTorch, so a fused Triton kernel would narrow the gap
+— recorded as a caveat, not a defense, since the accuracy wall is
+independent and unconditional.)
+
+The same "the epilogue eats the win" pattern sinks the per-channel
+workaround. Per-channel weight scaling is expressible without native
+support, since `w[k,n] = wq[k,n]*s[n]` gives `out[m,n] = s[n] * sum_k
+a[m,k]*wq[k,n]` — a post-GEMM broadcast multiply. Priced at ffn_in default:
+
+| | ms | vs fp16 |
+|---|---|---|
+| fp16 `F.linear` | 0.0527 | 1.00x |
+| `_scaled_mm` -> fp16 (fused bias) | 0.0306 | 1.72x |
+| `_scaled_mm` -> fp32 + per-channel scale + bias | 0.0465 | 1.13x |
+| ... + cast back to fp16 | 0.0539 | **0.98x** |
+
+fp32 output forfeits the fused bias (unsupported), so the epilogue becomes
+a separate full pass over `[M,N]` and gives the entire 1.72x back.
+
+**Conclusion: no code change.** fp8 is disqualified twice over, and the
+binding constraint is the one no amount of engineering moves: at rtol=2%,
+the tolerance is *tighter than e4m3's own precision*. The three levers
+that make fp8 work in production LLM inference — outlier-isolating group
+scales, a loss-based sensitivity budget, and tolerance for ~1% output
+drift — are all absent here. This project's accuracy contract is
+bit-exactness-or-near-it against an fp32 reference, and fp16 already
+spends 64% of that budget for a 1.8-2x GEMM win; fp8 asks for 20x the
+error to buy at most another 1.7x that is then given back at the
+quantization step. The existing `_resolve_fp16_gemm_enabled` path (step 3)
+remains the correct precision floor for this workload.
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
@@ -498,6 +657,7 @@ significant figures):
 | Error-compensated fp16 (hi+lo split GEMM) | Two fp16 GEMMs cost about as much as one TF32 GEMM. No win. |
 | Folding the attention scale into `W_q`/`b_q` | 3.9e-3 divergence in fp16 (bit-exact in bf16 only). Unsafe. |
 | ~~Fused QKV in fp16/bf16~~ | **Overturned in step 8.** Not kernel selection at all -- the fused and separate GEMMs dispatch to the *same* cutlass kernel. bf16 is bit-exact at every shape tried; fp16 at most. Now decided per-shape by a warmup `torch.equal` probe. |
+| **fp8 weight quantization (e4m3, incl. MX block-32 group scales)** | Fails twice over (step 10). Accuracy: e4m3's own relative precision (2.71% rel_rms) **exceeds the harness's 2% rtol**, so no placement works -- even ONE matrix in ONE layer, weight-only with an exact fp32 GEMM, lands at 2.3x the atol, while fp16 across the whole model uses 64% of the budget. Group scaling is inert here (identical error at every granularity: these untrained weights have no outliers to isolate). Speed: activation quantization costs 4-8x what the faster GEMM saves -- 0.26x vs the fp16 path at the default shape -- despite mxfp8 hitting a genuine ~147 TFLOPS (3.3x fp16) in isolation. |
 | Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. |
 | Inductor max-autotune GEMM (or a hand-written Triton GEMM) | Disabled on this GPU by inductor's SM-count gate (36 < 68 SMs); bypassed it and also hand-tuned a Triton GEMM for this exact hardware in step 7 -- cuBLAS still wins or ties at every shape this codebase actually runs. |
 
