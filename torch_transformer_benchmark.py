@@ -1157,6 +1157,164 @@ def _triton_short_attention(
     return out.view(batch, seq_len, heads * head_dim)
 
 
+# ---------------------------------------------------------------------------
+# GEMM with a fused bias + GELU epilogue (the FFN's first projection)
+# ---------------------------------------------------------------------------
+#
+# Steps 7 and 11 both concluded that a hand-written Triton GEMM does not beat
+# cuBLAS at these shapes, and that still holds -- the reduction axis is
+# d_model, so K is 128 for most graded rows, and measured throughput is a
+# steep function of K (9.2 TFLOP/s at K=32, 24.8 at K=128, 40.4 at K=512,
+# plateauing ~45). cuBLAS already sits on that ceiling.
+#
+# The bar here is different, and much lower: not "beat cuBLAS at the GEMM"
+# but "beat cuBLAS's GEMM *plus a separate ATen GELU pass*". Fusing deletes a
+# full write-then-read of the [batch*seq, ffn_dim] hidden tensor, which at
+# 13_ffn1024 is a 32 MB round trip -- right at this card's 32 MiB L2
+# capacity, so it is real DRAM traffic. cuBLAS runs that GEMM in 79.2 us and
+# ATen's GELU costs another 43.7, so a fused kernel only has to reach ~65% of
+# cuBLAS's throughput to come out ahead.
+#
+# Measured (CUDA-graph timed, fp16, vs `F.linear` + `F.gelu`):
+#
+#   shape (M x K x N)              cuBLAS+GELU   fused    ratio   bit-exact
+#   13_ffn1024   8192 x 128 x 1024     113.92    63.14   1.80x      yes
+#   07_seq32     2048 x  32 x  128       4.00     2.59   1.54x      yes
+#   05_batch128 16384 x 128 x  128      26.75    18.02   1.48x      yes
+#   01_base      8192 x 128 x  128      14.45    10.02   1.44x      yes
+#   08_seq1024  65536 x1024 x  128     437.42   386.37   1.13x      no
+#   default     1024 x 512 x 2048       56.67    52.23   1.09x      no
+#   12_ffn32     8192 x 128 x   32       5.25     6.05   0.87x      yes
+#   02_batch1     128 x 128 x  128       2.33     2.85   0.82x      yes
+#
+# BIT-EXACT at six of eight shapes -- `torch.equal`, not "close". Two things
+# make that possible and both are deliberate:
+#   * libdevice's `erf` is the same function ATen's GELU calls, so the
+#     transcendental agrees to the last bit.
+#   * the accumulator is rounded to the output dtype BEFORE the GELU, because
+#     `F.linear` materializes an fp16 tensor and ATen's GELU then reads that
+#     rounded value. Carrying fp32 into the epilogue would be more accurate
+#     than the reference, which this project counts as divergence too.
+# The two inexact shapes are the two with a long reduction axis (K=512,
+# K=1024), where Triton's k-loop order differs from cuBLAS's; they differ by
+# 3.8e-6, i.e. fp32 rounding, not a logic difference.
+#
+# Because it can be bit-exact, this is offered to the fp16/bf16 paths as well
+# as the fp32 one -- _probe_fused_ffn demands `torch.equal` there, exactly
+# like the fused-QKV probe of step 8, and lets the measurement decide.
+if _TRITON_AVAILABLE:
+
+    _GEMM_GELU_CONFIGS = [
+        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8},
+                      num_warps=nw, num_stages=ns)
+        for bm, bn, bk, nw, ns in [
+            (128, 128, 32, 4, 3), (128, 64, 32, 4, 3), (64, 128, 32, 4, 3),
+            (64, 64, 32, 4, 3), (128, 64, 64, 4, 3), (64, 64, 64, 4, 4),
+            (32, 64, 32, 4, 2), (64, 32, 32, 4, 2), (128, 128, 64, 8, 3),
+            (32, 32, 32, 2, 2), (256, 64, 32, 8, 3), (64, 256, 32, 8, 3),
+            (128, 32, 32, 4, 2), (32, 128, 32, 4, 2),
+        ]
+    ]
+
+    @triton.autotune(configs=_GEMM_GELU_CONFIGS, key=["M", "N", "K"])
+    @triton.jit
+    def _gemm_gelu_kernel(
+        a_ptr, b_ptr, c_ptr, bias_ptr, M, N, K,
+        s_am, s_ak, s_bk, s_bn, s_cm, s_cn,
+        APPLY_GELU: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+    ):
+        """C = gelu(A @ B + bias), grouped-tile ordering for L2 reuse.
+
+        `b_ptr` is the nn.Linear weight TRANSPOSED as a view ([K, N] strides
+        over the stored [N, K]), so no repacking copy is needed.
+        """
+        pid = tl.program_id(0)
+        grid_m = tl.cdiv(M, BLOCK_M)
+        grid_n = tl.cdiv(N, BLOCK_N)
+        width = GROUP_M * grid_n
+        group = pid // width
+        off = pid % width
+        m0 = group * GROUP_M
+        gm = min(grid_m - m0, GROUP_M)
+        pid_m = m0 + (off % gm)
+        pid_n = off // gm
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+        a_ptrs = a_ptr + rm[:, None] * s_am + rk[None, :] * s_ak
+        b_ptrs = b_ptr + rk[:, None] * s_bk + rn[None, :] * s_bn
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            krem = K - k * BLOCK_K
+            a = tl.load(a_ptrs, mask=(rm[:, None] < M) & (rk[None, :] < krem), other=0.0)
+            b = tl.load(b_ptrs, mask=(rk[:, None] < krem) & (rn[None, :] < N), other=0.0)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BLOCK_K * s_ak
+            b_ptrs += BLOCK_K * s_bk
+
+        bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+        # Round to the output dtype BEFORE the GELU -- see the module comment;
+        # this is what makes the result bit-identical to F.linear + F.gelu
+        # rather than merely close to it.
+        h = (acc + bias[None, :]).to(c_ptr.dtype.element_ty).to(tl.float32)
+        if APPLY_GELU:
+            h = h * 0.5 * (1.0 + _tl_libdevice.erf(h * 0.7071067811865476))
+        tl.store(c_ptr + rm[:, None] * s_cm + rn[None, :] * s_cn,
+                 h.to(c_ptr.dtype.element_ty),
+                 mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+# Shape boundary for the fused GEMM+GELU, MEASURED (table in the module
+# comment above), not derived. Below it cuBLAS's narrow-N / tiny-M kernels
+# win even after paying for a separate GELU pass: at N=32 the fused kernel
+# is 0.87x and at M=128 it is 0.82x, while every shape above the boundary is
+# 1.09x-1.80x. Like the FFN chunk size in step 5 and the fp16-GEMM margin in
+# step 3, this is an empirical boundary on this hardware and should be
+# re-measured, not trusted, if the GPU or cuBLAS version changes.
+_FUSED_FFN_MIN_ROWS = 256
+_FUSED_FFN_MIN_FFN = 64
+
+
+def _fused_ffn_supported(rows: int, ffn_dim: int) -> bool:
+    return rows >= _FUSED_FFN_MIN_ROWS and ffn_dim >= _FUSED_FFN_MIN_FFN
+
+
+def _triton_gemm_gelu(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """gelu(F.linear(x, weight, bias)) for a [B, S, K] input, in one kernel.
+
+    Returns [B, S, N]. Raises rather than falling back, so a real failure
+    cannot masquerade as an unsupported shape -- the caller's probe decides
+    fallback once, at warmup.
+    """
+    *lead, k_dim = x.shape
+    rows = 1
+    for d in lead:
+        rows *= d
+    n_dim = weight.shape[0]
+    a = x.reshape(rows, k_dim)
+    if not a.is_contiguous():
+        raise ValueError("fused FFN GELU requires a contiguous input")
+    out = torch.empty((rows, n_dim), device=x.device, dtype=x.dtype)
+    wt = weight.t()  # [K, N] view over the stored [N, K]; no copy
+
+    def grid(meta):
+        return (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(n_dim, meta["BLOCK_N"]),)
+
+    _gemm_gelu_kernel[grid](
+        a, wt, out, bias, rows, n_dim, k_dim,
+        a.stride(0), a.stride(1), wt.stride(0), wt.stride(1),
+        out.stride(0), out.stride(1),
+        APPLY_GELU=True,
+    )
+    return out.view(*lead, n_dim)
+
+
 class _GraphCacheEntry:
     """Holds one captured CUDA graph plus the static input/output buffers it
     was captured against. Replaying requires copy_-ing fresh data into
@@ -1420,6 +1578,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._short_attn_gate: Dict[Tuple, bool] = {}
         self._short_attn_disabled: bool = not _TRITON_AVAILABLE
 
+        # Same again for the fused GEMM+GELU FFN projection
+        # (_gemm_gelu_kernel).
+        self._fused_ffn_gate: Dict[Tuple, bool] = {}
+        self._fused_ffn_disabled: bool = not _TRITON_AVAILABLE
+
     def _get_causal_allowed(self, seq_len: int, device: torch.device) -> torch.Tensor:
         key = (seq_len, device)
         cached = self._causal_allowed_cache.get(key)
@@ -1678,6 +1841,118 @@ class UserOptimizedTransformer(BaselineTransformer):
             return cached
         verdict = self._probe_fused_qkv_exact(x, valid_token_mask, mask_active, causal)
         self._fused_qkv_exact[key] = verdict
+        return verdict
+
+    def _probe_fused_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+    ) -> bool:
+        """Decide whether the fused GEMM+GELU may replace the FFN's first
+        projection plus its GELU, for this configuration.
+
+        Unlike the other two Triton kernels added in step 11, this one CAN be
+        bit-exact (see _gemm_gelu_kernel's module comment: same libdevice
+        `erf` as ATen, and the accumulator rounded to the output dtype before
+        the GELU), so it is offered to the fp16/bf16 paths too and the bar
+        there is `torch.equal` -- the step 8 pattern. On fp32 the bar is the
+        usual margin-scaled harness criterion against the exact fp32
+        reference, so that every enabled approximation is judged together.
+        """
+        if self._fused_ffn_disabled or x.device.type != "cuda":
+            return False
+        batch, seq_len, _ = x.shape
+        if self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim) is not None:
+            # The chunked path exists to bound peak memory at extreme
+            # ffn_dim; materializing one fused [rows, ffn_dim] output would
+            # defeat it.
+            return False
+        if not _fused_ffn_supported(batch * seq_len, self.config.ffn_dim):
+            return False
+
+        try:
+            with torch.inference_mode():
+                candidate = self._forward_core(
+                    x, valid_token_mask, mask_active, causal, use_sdpa,
+                    use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                    use_short_attn, use_fused_ffn=True,
+                )
+                if x.dtype == torch.float32:
+                    reference = self._forward_core(
+                        x, valid_token_mask, mask_active, causal,
+                        use_sdpa=True, use_fp16_gemm=False,
+                        use_fused_qkv=False, layout=None, use_fused_ln=False,
+                        use_short_attn=False, use_fused_ffn=False,
+                    )
+                else:
+                    reference = self._forward_core(
+                        x, valid_token_mask, mask_active, causal, use_sdpa,
+                        use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                        use_short_attn, use_fused_ffn=False,
+                    )
+        except Exception:
+            self._fused_ffn_disabled = True
+            return False
+
+        if x.dtype == torch.float32:
+            atol, rtol = _fp16_gemm_gate_thresholds()
+            abs_err = (candidate - reference).abs()
+            rel_err = abs_err / reference.abs().clamp_min(1e-12)
+            ok = ((abs_err <= _FP16_GEMM_GATE_MARGIN * atol)
+                  | (rel_err <= _FP16_GEMM_GATE_MARGIN * rtol))
+            passed = bool(torch.all(ok).item())
+            detail = (f"failed={int((~ok).sum().item())}/{ok.numel()} "
+                      f"max_abs={abs_err.max().item():.6g}")
+        else:
+            passed = bool(torch.equal(candidate, reference))
+            detail = f"differing={int((candidate != reference).sum().item())}/{reference.numel()}"
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            print(
+                f"[fused-ffn-probe] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"ffn_dim={self.config.ffn_dim} {detail} -> "
+                f"{'ENABLE' if passed else 'DISABLE (cuBLAS + ATen GELU)'} fused-FFN",
+                file=sys.stderr,
+            )
+        return passed
+
+    def _resolve_fused_ffn_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        mask_kind: str,
+    ) -> bool:
+        """Probe once per configuration key and cache -- see
+        _probe_fused_ffn."""
+        if self._fused_ffn_disabled or x.device.type != "cuda":
+            return False
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind,
+               use_fp16_gemm, use_fused_qkv, layout is not None,
+               use_fused_ln, use_short_attn)
+        cached = self._fused_ffn_gate.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._probe_fused_ffn(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+        )
+        self._fused_ffn_gate[key] = verdict
         return verdict
 
     def _probe_short_attn(
@@ -2035,27 +2310,31 @@ class UserOptimizedTransformer(BaselineTransformer):
             x, valid_token_mask, mask_active, causal, use_sdpa,
             use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_short_attn,
         )
+        use_fused_ffn = self._resolve_fused_ffn_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn, mask_kind,
+        )
 
         if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn, use_fused_ffn)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -2088,6 +2367,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         mask_kind: str,
         use_fused_ln: bool = False,
         use_short_attn: bool = False,
+        use_fused_ffn: bool = False,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
             self._graph_pool = torch.cuda.graph_pool_handle()
@@ -2103,12 +2383,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn)
+                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
         torch.cuda.current_stream().wait_stream(warmup_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn)
+            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -2332,6 +2612,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         layout=None,
         use_fused_ln: bool = False,
         use_short_attn: bool = False,
+        use_fused_ffn: bool = False,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
@@ -2369,6 +2650,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         F.scaled_dot_product_attention with the single-block
         _short_attn_kernel, which also returns the context already merged
         back to [B, S, d_model].
+
+        `use_fused_ffn` (see _resolve_fused_ffn_enabled) replaces the FFN's
+        first projection and its GELU with one _gemm_gelu_kernel launch.
+        Unlike the other two, it can be bit-exact, so it is available on
+        every dtype path.
         """
         batch, seq_len, d_model = x.shape
 
@@ -2489,8 +2775,11 @@ class UserOptimizedTransformer(BaselineTransformer):
                     # dtype, same as softmax/LayerNorm) -- verified
                     # torch.equal, not just close. Removes 2 elementwise
                     # kernel launches and halves this op's memory traffic.
-                    hidden = F.linear(normed2, ffn_in_weight16, ffn_in_bias16)
-                    hidden = F.gelu(hidden, approximate="none")
+                    if use_fused_ffn:
+                        hidden = _triton_gemm_gelu(normed2, ffn_in_weight16, ffn_in_bias16)
+                    else:
+                        hidden = F.linear(normed2, ffn_in_weight16, ffn_in_bias16)
+                        hidden = F.gelu(hidden, approximate="none")
                     pending = F.linear(hidden, ffn_out_weight16, ffn_out_bias16)
                 else:
                     pending = self._chunked_ffn_fp16gemm(
@@ -2586,7 +2875,12 @@ class UserOptimizedTransformer(BaselineTransformer):
             )
 
             if chunk_size is None:
-                pending = layer.ffn_out(F.gelu(layer.ffn_in(normed2), approximate="none"))
+                if use_fused_ffn:
+                    hidden = _triton_gemm_gelu(
+                        normed2, layer.ffn_in.weight, layer.ffn_in.bias)
+                else:
+                    hidden = F.gelu(layer.ffn_in(normed2), approximate="none")
+                pending = layer.ffn_out(hidden)
             else:
                 pending = self._chunked_ffn_fp32(normed2, layer.ffn_in, layer.ffn_out, chunk_size)
 
