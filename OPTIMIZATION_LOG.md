@@ -98,6 +98,7 @@ Each step was developed on its own branch and merged only after measurement.
 | 9 | inductor-generated layout copies (bit-exact) | **1.189x** | 5/5 |
 | 10 | investigated fp8 weight quantization -- **no change merged** | 1.189x (unchanged) | 5/5 |
 | 11 | two shape-specialized Triton kernels for the graded shapes | 1.172x default suite; **3.764x** geomean on the graded matrix | 5/5 + 13/13 (+ 60/60 sweep) |
+| 14 | block-triangular causal Q@K^T (bit-exact) | default suite unchanged; **1.068x** on long_causal_fp16 | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -944,6 +945,92 @@ game, they exploit a structural property of the given shapes (a whole row, or a
 whole score matrix, fits in one block) that the general-purpose kernel cannot
 assume.
 
+
+### Step 14 — block-triangular causal Q@K^T (bit-exact)
+
+Causal attention computes the full `[S,S]` score matrix and throws away the
+half above the diagonal — §5b's MFU note says as much ("no discount for
+causal masking since the full `[S,S]` score matrix is computed either
+way"). This step stops computing the discarded half of `Q@K^T`.
+
+For a query block `[start, end)`, every key `j >= end` is strictly above the
+diagonal for *every* query in that block, so `_fused_scale_mask_kernel`
+overwrites those columns with `-inf` no matter what `Q@K^T` left there.
+They are simply never computed; the buffer's upper-triangular blocks keep
+whatever the allocator handed over. That is safe rather than merely
+untested: the kernel does load those positions but discards the value in
+the same `tl.where` that substitutes `-inf`. Verified by filling the buffer
+with **NaN** before the call and requiring `torch.equal` on both `probs`
+and the attention output.
+
+**The rule that makes this legal, where step 4's softmax fusion was not.**
+Step 4 established that reimplementing a reduction breaks bit-exactness.
+The distinction turns out to be sharper than "reductions are unsafe" —
+what matters is *which dimension is shortened*:
+
+| operation | dimension truncated | bit-exact? |
+|---|---|---|
+| `Q@K^T` over fewer keys | N (reduction axis K stays `head_dim`) | **yes** — 28/28 configs |
+| ATen `softmax` over a truncated row vs `-inf`-padded | reduction, but the padding is exact zeros | **yes** — 18/18 configs |
+| `probs@V` over fewer keys | **K, the reduction axis** | **no** — fp16 7.8e-3, bf16 2.5e-1 at S=2048 (passes at 512) |
+
+Shortening a non-reduction dimension cannot reassociate anything, so every
+computed element is the identical dot product it was before. Shortening the
+reduction axis re-tiles the GEMM, and the result is the same non-monotonic
+cuBLAS K-tiling sensitivity as the softmax bug in step 5 and the fused-QKV
+probe in step 8. **So only `Q@K^T` is blocked; `probs@V` is left whole** —
+which also means the full-width `probs` (zeros above the diagonal) still
+has to be materialised, capping this step well below the ~1.47x that
+halving the whole epilogue would give.
+
+The middle row is the surprise, and it is worth recording even though this
+step does not yet use it: step 4's failure came from *reimplementing* the
+softmax reduction in Triton, not from *shortening* ATen's own. Truncating
+ATen's softmax is exact.
+
+**Block size** is a coarse two-step function of `seq_len`, from measured
+speedup of the blocked form vs one full GEMM (fp16/bf16, head_dim=64):
+
+| seq_len | BR=64 | BR=128 | BR=256 | BR=512 |
+|---|---|---|---|---|
+| 128 | 0.26x | 0.55x | — | — |
+| 256 | 0.70x | **1.28x** | 1.00x | — |
+| 512 | 1.32x | **1.31x** | 1.23x | 0.96x |
+| 2048 fp16 | 0.87x | 1.74x | **1.72x** | 1.52x |
+| 2048 bf16 | 1.01x | 1.82x | **1.98x** | 1.59x |
+
+Below `seq_len=256` the extra launches cost more than the skipped work is
+worth, so the gate declines entirely. Deliberately not a fitted curve —
+these numbers move with driver and cuBLAS versions, and the result is
+probed for bit-exactness regardless (`_probe_tri_qk_exact`, the step 8
+pattern: run the whole forward both ways, require `torch.equal`, cache per
+configuration key, two extra warmup forwards and nothing at steady state).
+
+**Results** (optimized median, interleaved A/B, 2 reps each):
+
+| case | main | step 14 | |
+|---|---|---|---|
+| long_causal_fp16 (B4 S2048) | 39.027 / 39.059 | **36.556 / 36.555** | **1.068x** |
+| big_causal_fp16 (B32 S512) | 34.284 / 34.301 | **33.535 / 33.697** | 1.02x |
+| causal_fp16 (B8 S128) | 1.5307 | 1.5303 | unchanged (gate declines) |
+| big_noncausal_fp16 | 34.2737 | 34.2731 | unchanged (not causal) |
+
+All bit-exact: `max_abs=0`, `failed=0/41,943,040` over 5 trials at
+big_causal. Default suite still 5/5.
+
+**Scope is narrow, deliberately.** The gate requires the fp16/bf16
+manual-math path (fp32 uses SDPA, which applies causality itself), causal,
+CUDA, and `seq_len >= 256`. That excludes the whole `user_matrix` suite
+(fp32 → SDPA) and `causal_fp16` (S=128), so the headline default-suite
+number does not move. The win is confined to fp16/bf16 causal attention at
+`seq_len >= 256`, where it is real and reproducible to four significant
+figures.
+
+**Unrelated pre-existing failure found while measuring**, recorded here so
+it is not mistaken for a regression from this step: `--dtype bfloat16
+--batch-size 4 --seq-len 2048 --causal` FAILs on `main` as well, with
+`max_abs=0.046875` (~6 bf16 ulps). It reproduces identically with and
+without this step's change, so it predates it. Not diagnosed here.
 
 ## 4. Rejected after measurement
 
