@@ -97,6 +97,7 @@ Each step was developed on its own branch and merged only after measurement.
 | 8 | fused QKV in fp16/bf16 where a probe proves it bit-exact | 1.096x | 5/5 |
 | 9 | inductor-generated layout copies (bit-exact) | **1.189x** | 5/5 |
 | 10 | investigated fp8 weight quantization -- **no change merged** | 1.189x (unchanged) | 5/5 |
+| 11 | two shape-specialized Triton kernels for the graded shapes | 1.172x default suite; **3.764x** geomean on the graded matrix | 5/5 + 13/13 (+ 60/60 sweep) |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -647,6 +648,303 @@ error to buy at most another 1.7x that is then given back at the
 quantization step. The existing `_resolve_fp16_gemm_enabled` path (step 3)
 remains the correct precision floor for this workload.
 
+### Step 11 - exploiting the fact that the test shapes are given
+
+Everything through step 9 was tuned against the `default` suite, whose shape
+(batch=8, seq=128, d_model=512, ffn=2048) is 85% GEMM and therefore
+compute-bound. **The graded configurations are not that workload at all**, and
+optimizing for them is a different problem.
+
+#### The shapes, grouped
+
+The 14-row grading matrix (`run_bench.py`'s `user_matrix` suite) splits into
+four groups by what actually limits them:
+
+| group | rows | shape | what limits it |
+|---|---|---|---|
+| **A. tiny model, batch/head/ffn sweep** | 01-06, 09-13 | d_model 128, ffn 32/128/1024, S=128, L=4 | memory + per-kernel overhead; dense matmul is only ~40% of the work |
+| **B. degenerate small** | 07 | d_model 32, S=32, B=64 | almost entirely fixed per-kernel cost |
+| **C. long/wide** | 08 | d_model 1024, S=1024, B=64, head_dim 256 | genuinely GEMM-bound, like the default suite |
+| **D. extreme ffn** | 14 | ffn_dim 100000, B=32, S=1024 | capacity; already handled by step 5's chunked FFN |
+
+The properties worth exploiting are in groups A and B, and they are structural,
+not incidental:
+
+* **d_model is 32 or 128 in 12 of 14 rows** (1024 in the other two), always a
+  power of two, never above 1024. An entire residual row therefore fits in one
+  Triton block.
+* **seq_len is 32 or 128 in 12 of 14 rows.** An entire `[S, S]` attention score
+  matrix for one (batch, head) therefore fits in one block.
+* **ffn_dim is <= d_model in 11 of 14 rows** (32 or 128 against d_model=128).
+* head_dim ranges over 8/32/64/128/256 - and 8 and 32 are small enough that
+  cuBLAS and SDPA are both operating well outside the regime they are tuned
+  for.
+
+#### Where the time actually went (measured, not assumed)
+
+Profiled under CUDA-graph replay at three representative group-A/B rows, on
+the step-9 code:
+
+| | 01_base | 07_seq32 | 13_ffn1024 |
+|---|---|---|---|
+| LayerNorm (9 launches) | **35.5%** | **42.5%** | 20.3% |
+| GEMMs | 28.4% | 17.3% | 50.8% |
+| attention (`fmha_cutlassF`) | 17.6% | 20.3% | 9.0% |
+| residual adds + dtype casts | 9.6% | 11.4% | 6.1% |
+| GELU | 2.0% | 3.2% | 8.4% |
+
+LayerNorm being the single largest item is the whole story of this step. ATen's
+`layer_norm_kernel` is written for wide rows; at d_model=32 it moved 512 KB in
+9.4 us - about **55 GB/s** on a card that sustains several hundred. That gap
+does not exist at d_model=512, which is why nine steps of tuning never
+surfaced it.
+
+#### Kernel 1: fused residual-add + LayerNorm (`_add_ln_kernel`)
+
+One kernel replaces the four-to-five ATen kernels at each of the model's
+residual sites:
+
+```
+(fp16->fp32 cast) -> masked_fill -> add -> layer_norm -> (fp32->fp16 cast)
+```
+
+Each of those streamed the whole `[B, S, d_model]` activation separately. The
+fused version reads `x` and `delta` once and writes the updated residual and
+the normalized output once. `_forward_core` was restructured around a single
+`_ln_site` helper to make this a call-site decision rather than a second copy
+of the layer body: the residual add that closes each sub-block is handed to the
+*next* LayerNorm as a pending `delta` instead of being applied eagerly.
+
+The given shapes are what make the kernel simple: `BLOCK_D = next_pow2(d_model)`
+covers the entire feature axis, so the reduction is a single in-register pass
+with no loop and no cross-block communication, and several rows fit in one
+block (`BLOCK_M`), which is what fixes d_model=32 - one row per block would
+have launched 65536 blocks of 32 elements.
+
+Two things this surfaced that were not obvious:
+
+* **The residual must be rounded to its own storage dtype before the norm
+  reads it.** Keeping the fp32 accumulator alive into the reduction is *more*
+  accurate than the eager chain, which materializes `x + delta` as a real
+  tensor first - and this project counts being more accurate than the
+  reference as divergence too. Measured 0.0156 (two bf16 ulps) off the ATen
+  chain before the fix; a no-op for an fp32 residual.
+* **No autotuning**, deliberately, unlike the other Triton kernels here. This
+  one runs inside the CUDA-graph-captured region in several flag variants per
+  layer, and autotuning benchmarks on first call, which syncs. A deterministic
+  BLOCK_M/num_warps rule removes that hazard class outright, and this kernel is
+  pure streaming plus one in-register reduction, where the spread between
+  reasonable configs is small.
+
+#### Follow-up: per-shape-group launch parameters for kernel 1
+
+The first version picked `BLOCK_M`/`num_warps` from a guessed target of ~2048
+elements per block. Sweeping `BLOCK_M x num_warps` over 1..64 x 1..8 at every
+d_model the graded groups use -- timed under CUDA-graph replay, since an eager
+sweep at 1-13 us per launch ranks the 5-10 us launch floor instead of the
+kernel -- showed that guess was wrong in a consistent direction:
+
+| shape | d_model | 2048-elem rule | measured best | gap |
+|---|---|---|---|---|
+| 07_seq32 | 32 | BM=8, w=1: 1.37 us | BM=16, w=4: 1.26 us | 1.08x |
+| 02_batch1 | 128 | BM=8, w=4: 1.29 us | BM=1, w=1: 1.19 us | 1.08x |
+| 04_batch16 | 128 | BM=8, w=4: 2.81 us | BM=4, w=1: 2.41 us | 1.16x |
+| 01_base | 128 | BM=8, w=4: 7.33 us | BM=4, w=4: 6.60 us | 1.11x |
+| default_fp32 | 512 | BM=4, w=8: 5.34 us | BM=1, w=4: 4.04 us | **1.32x** |
+| 06_batch10000 | 128 | BM=8, w=4: 5263 us | BM=4, w=8: 5242 us | 1.00x |
+| 08_seq1024 | 1024 | BM=2, w=8: 2158 us | BM=16, w=8: 2151 us | 1.00x |
+
+The optimum tracks **~512 elements per block**, not 2048, across the whole
+range: d_model=32 wants BLOCK_M=16, d_model=128 wants 4, d_model=512 wants 1 --
+all the same tile. Separately, at batch=1 (M=128 rows) even the 512-element
+rule leaves 32 blocks for 36 SMs, so a block-count floor (halve BLOCK_M until
+the grid covers the device twice over) matters more there than tile size does.
+`_add_ln_launch_params` is now those two rules and takes the row count and
+device, and it reaches the measured optimum at 6 of 9 shapes with the worst
+remaining gap 1.12x (was 1.32x).
+
+**End to end this is worth nothing measurable: 1.000x geomean over the graded
+matrix.** Repeating an identical configuration five times per case puts the
+per-process noise floor at 1.006x-1.059x spread, and the whole A/B scatter
+(0.958x-1.086x, no consistent sign) sits inside it. The kernel is 12-16% of the
+forward, so a 10% kernel win is ~1.5% end to end -- below what this benchmark
+can resolve at these shapes. Kept anyway: it is a strictly better-founded rule
+at equal complexity, it is reproducibly faster at the kernel level at every
+shape, and the two shapes where this kernel actually dominates the forward
+(batch=10000, seq=1024) are bandwidth-bound and were already at their optimum
+under either rule. Recorded here so it is not re-derived later as an
+unexplored idea.
+
+#### Kernel 2: single-block short-sequence attention (`_short_attn_kernel`)
+
+With all `S` keys resident in one program, the softmax is a plain single-pass
+row reduction - there is no need for the running-max/running-sum rescale that a
+key-tiled flash-style kernel is forced into. `fmha_cutlassF` is tiled for long
+sequences and at S=128 is doing that bookkeeping for a problem that needs none
+of it: measured ~15 TFLOPS against a ~44 TFLOPS ceiling and 58% of the
+bandwidth roof. That is a structural mismatch to the shape, not a tuning gap -
+which is the distinction step 7 got wrong in the other direction.
+
+The kernel also returns the context already merged to `[B, S, d_model]`, by
+allocating the output in `[B, S, H, HD]` order and handing the kernel
+transposed strides, so the merge stays a free view.
+
+**Two measurements that changed the design:**
+
+* **The query axis has to be tiled for occupancy, and BLOCK_Q/num_warps must be
+  autotuned, not chosen by rule.** A fixed heuristic (`BLOCK_Q=128,
+  num_warps=1` at head_dim=8) made `11_heads16` **4x slower than the ATen path
+  it replaced**. Sweeping the config space at that shape:
+
+  | config | time | vs best |
+  |---|---|---|
+  | BLOCK_Q=64, num_warps=4 | 75 us | 1.00x (SDPA: 121 us) |
+  | BLOCK_Q=128, num_warps=4 | 85 us | 1.13x |
+  | BLOCK_Q=32, num_warps=8 | 369 us | 4.9x |
+  | BLOCK_Q=128, num_warps=1 | 803 us | **10.7x** |
+
+  `num_warps=1` lost at every shape tried, by 2x to 10x - one warp has to hold
+  the whole `[BLOCK_Q, BLOCK_S]` score tile and spills. The best config also
+  genuinely moves with the shape (BLOCK_Q=128 wins at head_dim=32, BLOCK_Q=64
+  at head_dim=8 and 128), so it is autotuned over 9 configs. That is legal
+  inside the graph only because `_probe_short_attn` drives a whole forward with
+  the kernel enabled before capture is ever attempted - the same pre-capture
+  warmup contract `_fused_scale_mask_kernel` already relied on.
+* A softmax denominator broadcast along the wrong axis (`probs / denom` instead
+  of `probs / denom[:, None]`) produced max_abs 3.49. The gate caught it and
+  disabled the kernel; the model stayed correct. Worth recording as the reason
+  the probes compare *whole forwards* rather than spot-checking a tile.
+
+#### What was investigated and NOT changed
+
+**A Triton GEMM for the narrow-N shapes.** Profiles showed cuBLAS dispatching
+these to `cutlass_80_wmma_tensorop` (~20-26 TFLOPS) rather than the `s16816`
+mma.sync kernel it uses at d_model=512 (~39-44 TFLOPS), which looked like step
+7's conclusion might not hold at these shapes. It does hold, for a different
+reason than step 7's: at K=128 these GEMMs are **bandwidth-bound, not
+compute-bound**. One layer's four GEMMs at `01_base` move 20 MB and cuBLAS runs
+them at ~78% of this card's bandwidth roof, so the entire available win is
+~1.28x even against a perfect kernel - and the fp16 TFLOPS figure is simply the
+wrong yardstick for the shape.
+
+A related trap worth recording: an eager microbenchmark says every GEMM with
+K=32 or N=32 takes 12.8-13.9 us *regardless of size* (`2048x32x32` costs the
+same as `8192x128x128`). That is the Python launch floor, not GPU time - under
+CUDA-graph replay the same GEMMs measure ~2 us. Any conclusion about small
+shapes drawn from an eager microbenchmark here is wrong.
+
+**In-process A/B measurement.** Building many models in one process trips
+dynamo's recompile limit (the step-9 compiled-layout probe silently turns
+itself off after ~8 instances) and grows the CUDA graph pool; an in-process
+three-arm A/B swung 30% between repetitions and reported a fictitious 0.65x
+regression on `default_fp16`. All numbers below are one process per (case,
+arm).
+
+#### Results
+
+Two things are being measured and they answer different questions. The A/B
+below isolates *what these two kernels contributed*, against the step-9 code
+on the same hardware in the same process-per-measurement protocol. The harness
+table after it is the actual bar: `run_bench.py --suite user_matrix`, each row
+scored against its own `torch.compile`d baseline.
+
+Graded matrix, fp32, one process per measurement, median of 80
+CUDA-event-timed replays (rows 06 and 14 excluded here - capacity cases whose
+runtimes are dominated by data movement this A/B cannot resolve):
+
+| case | step 9 | + fused LN | + short attn | LN | attn | total |
+|---|---|---|---|---|---|---|
+| 01_base | 0.8835 | 0.5254 | 0.4830 | 1.681x | 1.088x | **1.829x** |
+| 02_batch1 | 0.1489 | 0.1129 | 0.0910 | 1.319x | 1.240x | **1.635x** |
+| 03_batch4 | 0.1634 | 0.1109 | 0.1280 | 1.472x | 0.867x | 1.277x |
+| 04_batch16 | 0.3029 | 0.1892 | 0.1948 | 1.601x | 0.972x | 1.556x |
+| 05_batch128 | 1.7870 | 1.0185 | 0.9504 | 1.755x | 1.072x | **1.880x** |
+| 07_seq32 | 0.2272 | 0.1228 | 0.1218 | 1.851x | 1.008x | **1.866x** |
+| 08_seq1024 | 136.02 | 107.76 | 107.84 | 1.262x | 0.999x | 1.261x |
+| 09_heads1 | 0.8866 | 0.5193 | 0.4710 | 1.707x | 1.103x | **1.882x** |
+| 10_heads2 | 0.8441 | 0.4806 | 0.4680 | 1.756x | 1.027x | **1.804x** |
+| 11_heads16 | 1.2231 | 0.8601 | 0.6755 | 1.422x | 1.273x | **1.811x** |
+| 12_ffn32 | 0.8311 | 0.4660 | 0.4157 | 1.783x | 1.121x | **1.999x** |
+| 13_ffn1024 | 1.4614 | 1.0954 | 1.0443 | 1.334x | 1.049x | 1.400x |
+| **geomean** | | | | **1.566x** | **1.063x** | **1.664x** |
+
+The attention kernel is worth +6.3% on top of the LayerNorm fusion and is a
+clear win on the larger group-A rows; on the three smallest cases it sits
+within run-to-run noise of 1.0x (those measurements are 0.1-0.2 ms and move
+~20% between repetitions). `08_seq1024` is group C: head_dim=256 and S=1024 put
+it outside both kernels' supported range, and it gets only the LayerNorm
+fusion.
+
+Kernel-level, at `01_base`: LayerNorm 314 us -> 61 us while also absorbing the
+residual adds and all 16 dtype-cast kernels, and 59 -> 35 kernel launches per
+iteration; attention 139 us -> 78 us.
+
+Against the stated bar (`run_bench.py --suite user_matrix`, each row vs its own
+`torch.compile`d baseline):
+
+| case | optimized ms | vs compiled bar | MFU |
+|---|---|---|---|
+| 01_base | 0.4541 | 2.214x | 38.76% |
+| 02_batch1 | 0.0711 | **12.191x** | 3.87% |
+| 03_batch4 | 0.0854 | **10.006x** | 12.88% |
+| 04_batch16 | 0.1674 | 5.153x | 26.29% |
+| 05_batch128 | 0.9149 | 3.137x | 38.48% |
+| 06_batch10000 | 108.6387 | 3.177x | 25.32% |
+| 07_seq32 | 0.0772 | **11.040x** | 6.23% |
+| 08_seq1024 | 107.2529 | 2.026x | 65.65% |
+| 09_heads1 | 0.4459 | 1.744x | 39.48% |
+| 10_heads2 | 0.4499 | 1.896x | 39.12% |
+| 11_heads16 | 0.6643 | 5.255x | 26.50% |
+| 12_ffn32 | 0.4008 | 2.355x | 35.68% |
+| 13_ffn1024 | 1.0399 | 2.402x | 46.55% |
+| **geomean (13/13 PASS)** | | **3.764x** | |
+
+Row 14 (ffn_dim=100000) is a capacity case and has to be measured separately,
+because the *unmodified* reference OOMs at that shape and needs step 5's
+`--chunk-baseline-ffn`. It passes with the new kernels live - 0 of 33,554,432
+elements failing, max_abs 0.0013 - at 688.3 ms against a 1453.9 ms chunked
+eager baseline, 2.11x. (Not comparable to the 15.77x recorded for this shape in
+step 5: that figure's warmup/repeat settings are not recorded, and this one was
+taken with `--warmup 3 --repeats 10 --benchmark-rounds 1` to keep a 1.5 s/iter
+baseline tractable. The point of re-measuring it here is that it still passes
+and is still faster, not a like-for-like comparison.) Only the LayerNorm
+fusion applies to it; S=1024 puts it outside the attention kernel's range. The very large ratios on rows 02/03/07 are the launch-overhead regime:
+those forwards are 70-90 us, where CUDA-graph replay plus a 59 -> 35 launch
+reduction dominates everything else, and MFU is correspondingly meaningless
+there (3.9% at batch=1 - the GPU is essentially idle either way, we just stop
+waiting on the CPU sooner).
+
+The `default` suite is unaffected where it should be and better where it can
+be - the fp16/bf16 cases stay **bit-exact** (both probes correctly refuse to
+enable there), and `default_fp32` picks up the LayerNorm fusion and the
+attention kernel:
+
+| case | step 9 | step 11 | vs compiled bar | accuracy |
+|---|---|---|---|---|
+| default_fp32 | 1.3572 | **1.1804** | 2.051x | PASS |
+| default_fp16 | 1.5395 | 1.5489 | 0.962x | PASS (max_abs 0) |
+| default_bf16 | 1.3580 | 1.3573 | 1.318x | PASS (max_abs 0) |
+| causal_fp16 | 1.5515 | 1.5518 | 0.950x | PASS (max_abs 0) |
+| padded_fp16 | 1.6368 | 1.6307 | 0.896x | PASS (max_abs 0) |
+| **geomean** | 1.189x | | **1.172x** | 5/5 |
+
+A 60-configuration accuracy sweep (10 shapes x {fp32, fp16, bf16} x {no
+padding, 40% padding}, 3 trials each) passes everywhere: fp32 max_abs
+9.6e-4 - 1.6e-3 against an atol of 2e-3, and fp16/bf16 max_abs exactly 0.
+
+#### Answering the question that started this step
+
+Before it, **one** Triton kernel shipped (`_fused_scale_mask_kernel`, an
+elementwise scale+mask on the fp16/bf16 attention epilogue), and it was not
+shape-specialized. The two hand-written kernels of steps 7 and 9 - a GEMM and a
+layout copy - were both measured and **rejected**. So: zero shape-specific
+Triton kernels. This step adds two, and both win for the same reason the
+earlier two lost: they are not attempts to out-tune a vendor kernel at its own
+game, they exploit a structural property of the given shapes (a whole row, or a
+whole score matrix, fits in one block) that the general-purpose kernel cannot
+assume.
+
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
@@ -658,7 +956,8 @@ remains the correct precision floor for this workload.
 | Folding the attention scale into `W_q`/`b_q` | 3.9e-3 divergence in fp16 (bit-exact in bf16 only). Unsafe. |
 | ~~Fused QKV in fp16/bf16~~ | **Overturned in step 8.** Not kernel selection at all -- the fused and separate GEMMs dispatch to the *same* cutlass kernel. bf16 is bit-exact at every shape tried; fp16 at most. Now decided per-shape by a warmup `torch.equal` probe. |
 | **fp8 weight quantization (e4m3, incl. MX block-32 group scales)** | Fails twice over (step 10). Accuracy: e4m3's own relative precision (2.71% rel_rms) **exceeds the harness's 2% rtol**, so no placement works -- even ONE matrix in ONE layer, weight-only with an exact fp32 GEMM, lands at 2.3x the atol, while fp16 across the whole model uses 64% of the budget. Group scaling is inert here (identical error at every granularity: these untrained weights have no outliers to isolate). Speed: activation quantization costs 4-8x what the faster GEMM saves -- 0.26x vs the fp16 path at the default shape -- despite mxfp8 hitting a genuine ~147 TFLOPS (3.3x fp16) in isolation. |
-| Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. |
+| Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. Still true for fp16/bf16; step 11's short-sequence attention kernel does exactly this and is therefore fp32-only, gated on the calibration bar. |
+| Triton GEMM for the graded shapes' narrow-N matmuls | Step 7's conclusion holds, but for a different reason at these shapes: at K=128 the GEMMs are bandwidth-bound and cuBLAS already runs at ~78% of the card's bandwidth roof, capping any possible win at ~1.28x. The low fp16 TFLOPS figure is the wrong yardstick. |
 | Inductor max-autotune GEMM (or a hand-written Triton GEMM) | Disabled on this GPU by inductor's SM-count gate (36 < 68 SMs); bypassed it and also hand-tuned a Triton GEMM for this exact hardware in step 7 -- cuBLAS still wins or ties at every shape this codebase actually runs. |
 
 ## 5. Behaviour against a compiled baseline
@@ -733,10 +1032,16 @@ genuine edge on `default_fp16`/`causal_fp16`/`padded_fp16`.
 ## 6. Reproducing
 
 ```
-python run_bench.py --suite default    # 5 configs, correctness + speed
-python run_bench.py --suite full       # 10 configs incl. long-seq and wide
-python profile_baseline.py float32     # kernel-level profile of the bar
+python run_bench.py --suite default      # 5 configs, correctness + speed
+python run_bench.py --suite full         # 10 configs incl. long-seq and wide
+python run_bench.py --suite user_matrix  # the 14-row graded matrix (step 11)
+python profile_baseline.py float32       # kernel-level profile of the bar
 ```
+
+Per-shape gate/probe decisions are printed to stderr with `TJ_DEBUG_GATE=1`:
+which of `fp16-GEMM`, `fused-QKV`, `compiled-layout`, `short-attn` and
+`fused-LN` were enabled for a given configuration, and the measured error
+that decided it.
 
 ## 7. Observation: progressive residual-stream boundary push (fp32-target, not baseline-bf16-match)
 
