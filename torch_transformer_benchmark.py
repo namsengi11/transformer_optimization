@@ -432,6 +432,82 @@ def _get_compiled_layout_helpers():
     return _COMPILED_LAYOUT["split"], _COMPILED_LAYOUT["merge"]
 
 
+# Below this sequence length the block-triangular causal Q@K^T (see
+# _blocked_causal_qk) costs more in extra kernel launches than it saves in
+# skipped work -- measured at seq_len=128, where the blocked form runs at
+# 0.26-0.56x the speed of one full GEMM.
+_TRI_QK_MIN_SEQ = 256
+
+
+def _causal_qk_block_size(seq_len: int) -> Optional[int]:
+    """Query-block size for _blocked_causal_qk, or None to keep a single
+    full GEMM.
+
+    Chosen by measurement on this GPU (fp16 and bf16, head_dim=64), timing
+    the blocked form against one torch.matmul at the shapes this codebase
+    runs -- speedup of blocked vs full:
+
+        seq_len   BR=64   BR=128   BR=256   BR=512
+          128     0.26x    0.55x      --       --
+          256     0.70x    1.28x    1.00x      --
+          512     1.32x    1.31x    1.23x    0.96x
+         2048     0.87x    1.74x    1.72x    1.52x   (fp16)
+         2048     1.01x    1.82x    1.98x    1.59x   (bf16)
+
+    Hence: nothing below 256; 128 in the middle, where the win comes from
+    skipping work; 256 once rows are long enough that each block's own GEMM
+    still wants to be big. Deliberately a coarse two-step function of
+    seq_len rather than a fitted curve -- the surrounding numbers move with
+    driver and cuBLAS versions, and _resolve_tri_qk_enabled probes the
+    result for bit-exactness anyway.
+    """
+    if seq_len < _TRI_QK_MIN_SEQ:
+        return None
+    return 256 if seq_len >= 1024 else 128
+
+
+def _blocked_causal_qk(
+    q: torch.Tensor, kt: torch.Tensor, block: int, out: torch.Tensor
+) -> torch.Tensor:
+    """Causal Q@K^T that computes only the block-lower-triangle.
+
+    For the query block [start, end), every key j >= end is strictly above
+    the diagonal for EVERY query in that block, so
+    _fused_scale_mask_kernel overwrites those columns with -inf regardless
+    of what Q@K^T left there. They are therefore never computed, and
+    `out`'s upper-triangular blocks keep whatever the caching allocator
+    handed us.
+
+    That is safe rather than merely untested: the kernel does load those
+    positions, but discards the loaded value in the same `tl.where` that
+    substitutes -inf, so not even a NaN can propagate out of them.
+    Verified directly by filling `out` with NaN before the call and
+    requiring torch.equal on both `probs` and the attention output.
+
+    Bit-exactness turns on WHICH dimension gets shortened. Each block
+    truncates the GEMM's N (the key axis); the reduction axis K stays at
+    head_dim, untouched. Shortening a non-reduction dimension cannot
+    reassociate anything, so every computed element is the identical dot
+    product it was before -- verified torch.equal over the lower triangle
+    at every shape and dtype tried.
+
+    Shortening the REDUCTION axis is a different matter and is NOT done
+    here: truncating probs@V's K breaks bit-exactness at seq_len=2048
+    (fp16 7.8e-3, bf16 2.5e-1) while passing at 512 -- the same
+    non-monotonic cuBLAS K-tiling sensitivity as the softmax kernel-
+    selection bug in step 5 and the fused-QKV probe in step 8. So only
+    Q@K^T is blocked; probs@V is left whole.
+    """
+    seq_len = q.shape[-2]
+    for start in range(0, seq_len, block):
+        end = min(start + block, seq_len)
+        torch.matmul(
+            q[:, :, start:end, :], kt[:, :, :, :end],
+            out=out[:, :, start:end, :end],
+        )
+    return out
+
+
 def _fp16_gemm_gate_thresholds() -> Tuple[float, float]:
     """Base (atol, rtol) that the fp16-GEMM calibration gate scales its
     safety margin from. Overridable via TJ_ATOL / TJ_RTOL so the gate can be
@@ -1525,6 +1601,14 @@ class UserOptimizedTransformer(BaselineTransformer):
         # unconditionally as part of the SDPA path.
         self._fused_qkv_exact: Dict[Tuple, bool] = {}
 
+        # (tuple(x.shape), x.dtype, x.device, causal, mask_kind, ...) -> bool.
+        # Whether the block-triangular causal Q@K^T (_blocked_causal_qk) was
+        # proved BIT-EXACT (torch.equal on the whole forward output) against
+        # the single full GEMM for that configuration. Only ever populated on
+        # the fp16/bf16 manual-math path with causal=True; the fp32/SDPA path
+        # never enters this dict.
+        self._tri_qk_gate: Dict[Tuple, bool] = {}
+
         # (tuple(x.shape), x.dtype, x.device) -> (split_fn, merge_fn) | None.
         # Verified-bit-exact torch.compile'd layout helpers for that
         # configuration, or None to stay on ATen's copy kernels. `False` is
@@ -2184,6 +2268,95 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._fused_ln_gate[key] = verdict
         return verdict
 
+    def _probe_tri_qk_exact(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+    ) -> bool:
+        """Run the whole forward both ways on this configuration's real
+        input and require `torch.equal` before allowing the block-triangular
+        Q@K^T.
+
+        The argument in _blocked_causal_qk's docstring says this must pass:
+        only the GEMM's N is shortened, the reduction axis is untouched, and
+        the skipped columns are overwritten with -inf anyway. It is probed
+        regardless, for the reason step 8 records -- a claim about which
+        cuBLAS kernel gets selected, and what it does, is exactly the kind
+        of thing that has been wrong before in this file and that a driver
+        update can silently change. Two extra forwards once per
+        configuration key, nothing at steady state.
+        """
+        with torch.inference_mode():
+            reference = self._forward_core(
+                x, valid_token_mask, mask_active, causal, False,
+                use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                use_short_attn, use_fused_ffn, use_tri_qk=False,
+            )
+            candidate = self._forward_core(
+                x, valid_token_mask, mask_active, causal, False,
+                use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                use_short_attn, use_fused_ffn, use_tri_qk=True,
+            )
+        passed = bool(torch.equal(reference, candidate))
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            n_diff = int((reference != candidate).sum().item())
+            print(
+                f"[tri-qk-probe] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"block={_causal_qk_block_size(int(x.shape[1]))} "
+                f"differing={n_diff}/{reference.numel()} -> "
+                f"{'ENABLE' if passed else 'DISABLE (one full GEMM)'} "
+                f"block-triangular Q@K^T",
+                file=sys.stderr,
+            )
+        return passed
+
+    def _resolve_tri_qk_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+        mask_kind: str,
+    ) -> bool:
+        """Gate for the block-triangular causal Q@K^T. Applies only on the
+        fp16/bf16 manual-math path (the fp32/SDPA path lets SDPA apply
+        causality itself) with causal=True, on CUDA, and only at sequence
+        lengths where _causal_qk_block_size says the blocking pays for its
+        extra launches. Probes once per configuration key and caches."""
+        if use_sdpa or not causal or x.device.type != "cuda":
+            return False
+        if _causal_qk_block_size(int(x.shape[1])) is None:
+            return False
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind,
+               use_fp16_gemm, use_fused_qkv, layout is not None,
+               use_fused_ln, use_short_attn, use_fused_ffn)
+        cached = self._tri_qk_gate.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._probe_tri_qk_exact(
+            x, valid_token_mask, mask_active, causal, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+            use_fused_ffn,
+        )
+        self._tri_qk_gate[key] = verdict
+        return verdict
+
     def _resolve_compiled_layout(
         self,
         x: torch.Tensor,
@@ -2314,27 +2487,34 @@ class UserOptimizedTransformer(BaselineTransformer):
             x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
             use_fused_qkv, layout, use_fused_ln, use_short_attn, mask_kind,
         )
+        # Also a torch.equal sync, so likewise resolved out here rather
+        # than inside _forward_core / a captured region.
+        use_tri_qk = self._resolve_tri_qk_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+            use_fused_ffn, mask_kind,
+        )
 
         if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn, use_fused_ffn)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -2368,6 +2548,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_fused_ln: bool = False,
         use_short_attn: bool = False,
         use_fused_ffn: bool = False,
+        use_tri_qk: bool = False,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
             self._graph_pool = torch.cuda.graph_pool_handle()
@@ -2383,12 +2564,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
+                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
         torch.cuda.current_stream().wait_stream(warmup_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn)
+            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -2613,6 +2794,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_fused_ln: bool = False,
         use_short_attn: bool = False,
         use_fused_ffn: bool = False,
+        use_tri_qk: bool = False,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
@@ -2851,7 +3033,24 @@ class UserOptimizedTransformer(BaselineTransformer):
                 # an ATen fallback that is itself bit-exact with the
                 # baseline -- see that method's docstring); only the raw
                 # (unscaled) Q@K^T matmul happens here, unchanged.
-                scores_raw = torch.matmul(q, k.transpose(-2, -1))
+                kt = k.transpose(-2, -1)
+                tri_block = (
+                    _causal_qk_block_size(seq_len) if use_tri_qk else None
+                )
+                if tri_block is not None:
+                    # Only the block-lower-triangle is computed; the rest
+                    # of this buffer is overwritten with -inf by the
+                    # scale+mask kernel below and is never read as data.
+                    # See _blocked_causal_qk.
+                    scores_raw = _blocked_causal_qk(
+                        q, kt, tri_block,
+                        torch.empty(
+                            q.shape[0], q.shape[1], q.shape[2], k.shape[2],
+                            device=q.device, dtype=q.dtype,
+                        ),
+                    )
+                else:
+                    scores_raw = torch.matmul(q, kt)
                 probs = self._fused_attn_probs(
                     scores_raw, attn.scale, causal, mask_active,
                     valid_token_mask, causal_disallowed, invalid_keys, x.dtype,
