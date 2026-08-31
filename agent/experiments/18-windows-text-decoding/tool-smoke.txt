@@ -1,0 +1,7 @@
+Command: python -m compileall -q agent/tools
+Result: PASS (exit 0)
+
+Command: python -c "from agent.tools._common import gpu_query, process_sm_utilization; ..."
+Result: PASS (exit 0)
+GPU: NVIDIA GeForce RTX 5060 Ti, utilization query parsed successfully.
+Process samples: 5/5 returned PID-to-SM-utilization dictionaries; no exception.

@@ -27,6 +27,7 @@ main baseline.
 
 | Step | Outcome | Branch | Claim | Default delta | Matrix delta | Evidence |
 |---:|---|---|---|---:|---:|---|
+| 18 | DISCARDED | `opt/18-windows-text-decoding` | Loss-tolerant Windows subprocess decoding keeps GPU provenance alive | not run | not run | `agent/experiments/18-windows-text-decoding/quick.json` (untrusted) |
 
 ## 4. Agent rejection index
 
@@ -42,3 +43,19 @@ one experiment. Put step-specific detail in `agent/experiments/NN-slug/result.md
 
 Append one `### Step NN: title` section per completed experiment, in numeric order. Every
 number must name its `agent/tools/` producer and an artifact under `agent/`.
+
+### Step 18: Windows text decoding
+
+The first current-main baseline attempt crashed the foreign-load sampler while strict
+`cp1252` decoding processed `nvidia-smi pmon` output. Step 18 added replacement-tolerant
+decoding to captured-text subprocesses. Direct import/compile smoke checks passed, and the
+fixed-checkout quick suite completed 1/1 eager-reference accuracy with optimized latency
+1.0917-1.0958 ms (`agent/tools/bench.py`,
+`agent/experiments/18-windows-text-decoding/quick.json`).
+
+The artifact was nevertheless untrusted in all three runs. Each run mislabeled three
+short-lived benchmark children at 96-98% SM as foreign because `pmon` was sampled before a
+fresh descendant snapshot; children that exited between those calls disappeared from the
+tree. The verifier therefore returned `REFUTED`, the implementation stayed unmerged, and a
+fresh tooling step must fix both decoding and descendant-attribution races before baseline
+measurement.

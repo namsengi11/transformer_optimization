@@ -120,6 +120,19 @@ unless `RmProfilingAdminOnly=0`; Nsight Systems works without elevation.
 **How to apply:** Start with `agent/tools/env_check.py`. Use Tier 1 and 2 when Tier 3 reports
 `available:false`. Do not use `nvprof`. Do not silently change package versions.
 
+## Windows GPU provenance has two independent host-side failure modes
+
+**Lesson:** Loss-tolerant subprocess decoding is necessary but not sufficient; an own child
+can also exit between `pmon` sampling and descendant discovery and be mislabeled as foreign.
+
+**Evidence:** Step 18 removed the `cp1252` `UnicodeDecodeError` and completed three quick
+runs, but `agent/experiments/18-windows-text-decoding/quick.json` marked all three untrusted
+after attributing each run's short-lived 96-98% SM benchmark children to foreign work.
+
+**How to apply:** Use `errors="replace"` for captured diagnostic text, and bracket `pmon`
+with before/after process-tree snapshots so either snapshot can identify an own descendant.
+Require the end-to-end artifact to remain trusted; a live sampler alone is not enough.
+
 ## Rejections remain live evidence
 
 **Lesson:** A rejection is scoped to its measured mechanism and can be overturned only by new
