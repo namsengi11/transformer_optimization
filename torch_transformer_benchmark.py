@@ -14,6 +14,7 @@ The default thresholds are atol=0.001 and rtol=0.01 (1%).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import math
 import os
@@ -1391,6 +1392,24 @@ def _triton_gemm_gelu(
     return out.view(*lead, n_dim)
 
 
+def _no_static_cuda_launcher():
+    """Disable inductor's static CUDA launcher for the duration of a block.
+
+    On Windows / torch 2.8 that launcher overflows a C long with the 64-bit
+    CUDA stream handle (`OverflowError: Python int too large to convert to C
+    long`) the moment a compiled Triton kernel is launched -- documented in
+    step 7, and it is not limited to autotuned GEMM templates, it fires on an
+    ordinary pointwise clone too.
+
+    Returns a null context if inductor is unavailable, so the caller never
+    has to care whether this build has it.
+    """
+    try:
+        return torch._inductor.config.patch(use_static_cuda_launcher=False)
+    except Exception:
+        return contextlib.nullcontext()
+
+
 class _GraphCacheEntry:
     """Holds one captured CUDA graph plus the static input/output buffers it
     was captured against. Replaying requires copy_-ing fresh data into
@@ -2412,7 +2431,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                         x, valid_token_mask, mask_active, causal,
                         use_sdpa, use_fp16_gemm, use_fused_qkv, layout=None,
                     )
-                    with torch._inductor.config.patch(use_static_cuda_launcher=False):
+                    with _no_static_cuda_launcher():
                         candidate = self._forward_core(
                             x, valid_token_mask, mask_active, causal,
                             use_sdpa, use_fp16_gemm, use_fused_qkv, layout=helpers,
@@ -2560,16 +2579,42 @@ class UserOptimizedTransformer(BaselineTransformer):
         # per the documented torch.cuda.graph pattern -- this lets cuDNN/
         # cuBLAS pick kernels/workspaces outside of capture, where such
         # allocations are legal.
-        warmup_stream = torch.cuda.Stream()
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(3):
-                self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
-        torch.cuda.current_stream().wait_stream(warmup_stream)
+        #
+        # The static-launcher patch is held across BOTH the warmup and the
+        # capture, and that is load-bearing rather than belt-and-braces.
+        # dynamo specializes compiled code on the DISPATCH KEY SET, not just
+        # on shape and stride: a helper compiled while the probe ran under
+        # `torch.inference_mode()` is a cache miss when the caller runs the
+        # model under `torch.no_grad()` instead, and the resulting recompile
+        # lands wherever the first such call happens -- which is inside
+        # `torch.cuda.graph()`, where it hit the Windows static-launcher
+        # OverflowError, failed the capture, and permanently demoted the
+        # model to the eager path.
+        #
+        # Measured before this fix, default shape, forward called under
+        # `torch.no_grad()` (the ordinary inference idiom) rather than
+        # `inference_mode()`: fp16 1.55 ms -> 3.62 ms and bf16 1.30 ms ->
+        # 3.21 ms, i.e. 2.3x slower, silently, while still producing correct
+        # results. fp32 was unaffected because its SDPA path never uses the
+        # compiled layout helpers.
+        #
+        # This is the same class of trap as the stride-specialization one in
+        # step 9, on a different specialization axis, so the fix here is
+        # deliberately the general one -- make the whole captured region safe
+        # for a late recompile -- rather than another attempt to enumerate
+        # which variants must be pre-compiled. It costs nothing at steady
+        # state: replay never goes through the Python launcher at all.
+        with _no_static_cuda_launcher():
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(3):
+                    self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._graph_pool):
-            static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._graph_pool):
+                static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
 
         return _GraphCacheEntry(
             graph=graph,
