@@ -84,6 +84,12 @@ class TransformerConfig:
 # from the shape and the remaining capacity. Never use current free memory:
 # routing and tiling must not depend on neighbouring processes.
 _STREAMING_MEMORY_BUDGET_FRAC = 0.85
+# Isolated step-23 sweeps found that fixed score/probability workspaces reserve
+# about 1.35x their tensor bytes once allocator block rounding and GEMM workspace
+# are included. This calibrated multiplier is shape-independent; the remaining
+# terms below still scale from the requested shape and dtype.
+_STREAMING_REFERENCE_WORKSPACE_RESERVE = 1.35
+_STREAMING_QUERY_ALIGNMENT = 64
 
 
 def _capacity_terms_bytes(
@@ -4003,8 +4009,14 @@ def _estimated_streaming_model_bytes(
     return 2 * one_model_elements * element_bytes
 
 
-def _power_of_two_floor(value: int) -> int:
-    return 1 << (max(1, int(value)).bit_length() - 1)
+def _aligned_query_tile(value: int, seq_len: int) -> int:
+    value = max(1, min(value, seq_len))
+    if value < _STREAMING_QUERY_ALIGNMENT:
+        return value
+    return max(
+        _STREAMING_QUERY_ALIGNMENT,
+        (value // _STREAMING_QUERY_ALIGNMENT) * _STREAMING_QUERY_ALIGNMENT,
+    )
 
 
 def _streaming_shard_plan(
@@ -4033,18 +4045,19 @@ def _streaming_shard_plan(
     for reference_batch_shard in range(1, max_reference_batch + 1):
         resident_bytes = reference_batch_shard * per_batch_resident
         available_query_bytes = activation_budget - resident_bytes
-        bytes_per_query = (
+        bytes_per_query = int(
             2
             * reference_batch_shard
             * config.num_heads
             * config.seq_len
             * element_bytes
+            * _STREAMING_REFERENCE_WORKSPACE_RESERVE
         )
         max_queries = max(
             1,
             min(config.seq_len, available_query_bytes // max(1, bytes_per_query)),
         )
-        query_tile = min(config.seq_len, _power_of_two_floor(max_queries))
+        query_tile = _aligned_query_tile(max_queries, config.seq_len)
         candidate = (
             reference_batch_shard * query_tile,
             query_tile,
