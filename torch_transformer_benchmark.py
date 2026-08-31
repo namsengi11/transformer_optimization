@@ -1293,7 +1293,7 @@ if _TRITON_AVAILABLE:
         ]
     ]
 
-    @triton.autotune(configs=_GEMM_GELU_CONFIGS, key=["M", "N", "K"])
+    @triton.autotune(configs=_GEMM_GELU_CONFIGS, key=["M", "N", "K", "APPLY_GELU"])
     @triton.jit
     def _gemm_gelu_kernel(
         a_ptr, b_ptr, c_ptr, bias_ptr, M, N, K,
@@ -1360,6 +1360,55 @@ def _fused_ffn_supported(rows: int, ffn_dim: int) -> bool:
     return rows >= _FUSED_FFN_MIN_ROWS and ffn_dim >= _FUSED_FFN_MIN_FFN
 
 
+# Row-count floor for routing a projection through the Triton GEMM.
+# MEASURED (table below), not derived: below it cuBLAS's small-M kernels win.
+#
+# This overturns the conclusion of steps 7 and 11 for these shapes, and it is
+# worth being precise about why they got it wrong rather than just replacing
+# the number. Step 7 benchmarked at the *default* shape (d_model=512) and
+# found cuBLAS ahead, which is still true there for the FFN's wide-K
+# projection. Step 11 then argued from a K-sweep that cuBLAS was already
+# sitting on the short-reduction ceiling -- but that sweep only ever compared
+# cuBLAS against cuBLAS. It established the shape of the ceiling correctly and
+# then *assumed* cuBLAS reached it. It does not: at the narrow-N projections
+# these shapes produce (N = d_model or 3*d_model, with d_model 32 or 128)
+# cuBLAS dispatches to a wmma kernel and a plain Triton GEMM beats it
+# outright.
+#
+#   shape (M x K x N)                cuBLAS    Triton    ratio   bit-exact
+#   qkv       16384 x 128 x  384      90.88     44.10    2.06x      yes
+#   qkv        8192 x 128 x  384      29.12     20.32    1.43x      yes
+#   out_proj   1024 x 512 x  512      22.81     14.64    1.56x      yes
+#   ffn_out    8192 x  32 x  128       6.42      4.23    1.52x      yes
+#   out_proj  16384 x 128 x  128      19.22     14.55    1.32x      yes
+#   qkv        2048 x 128 x  384       8.59      6.93    1.24x      yes
+#   out_proj   8192 x 128 x  128      10.30      9.13    1.13x      yes
+#   qkv        1024 x 512 x 1536      52.14     46.95    1.11x      yes
+#   ffn_out    8192 x1024 x  128      55.82     55.36    1.01x       no
+#   ffn_out    1024 x2048 x  512      51.41     52.29    0.98x       no
+#   qkv         512 x 128 x  384       3.15      3.34    0.94x      yes
+#   qkv         128 x 128 x  384       2.17      2.45    0.89x      yes
+#
+# Bit-exact (`torch.equal`) at every shape with K <= 512, which is why this is
+# offered on the fp16/bf16 paths too and not just the fp32 one.
+_TRI_LINEAR_MIN_ROWS = 1024
+
+
+def _tri_linear_supported(rows: int) -> bool:
+    return rows >= _TRI_LINEAR_MIN_ROWS
+
+
+def _triton_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """F.linear(x, weight, bias) via _gemm_gelu_kernel with the epilogue off.
+
+    Same kernel as the fused FFN projection, so there is one GEMM
+    implementation and one autotune cache in this file rather than two.
+    """
+    return _gemm_gelu_impl(x, weight, bias, apply_gelu=False)
+
+
 def _triton_gemm_gelu(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
@@ -1369,6 +1418,12 @@ def _triton_gemm_gelu(
     cannot masquerade as an unsupported shape -- the caller's probe decides
     fallback once, at warmup.
     """
+    return _gemm_gelu_impl(x, weight, bias, apply_gelu=True)
+
+
+def _gemm_gelu_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, apply_gelu: bool
+) -> torch.Tensor:
     *lead, k_dim = x.shape
     rows = 1
     for d in lead:
@@ -1376,7 +1431,7 @@ def _triton_gemm_gelu(
     n_dim = weight.shape[0]
     a = x.reshape(rows, k_dim)
     if not a.is_contiguous():
-        raise ValueError("fused FFN GELU requires a contiguous input")
+        raise ValueError("the Triton GEMM requires a contiguous input")
     out = torch.empty((rows, n_dim), device=x.device, dtype=x.dtype)
     wt = weight.t()  # [K, N] view over the stored [N, K]; no copy
 
@@ -1387,7 +1442,7 @@ def _triton_gemm_gelu(
         a, wt, out, bias, rows, n_dim, k_dim,
         a.stride(0), a.stride(1), wt.stride(0), wt.stride(1),
         out.stride(0), out.stride(1),
-        APPLY_GELU=True,
+        APPLY_GELU=apply_gelu,
     )
     return out.view(*lead, n_dim)
 
@@ -1686,6 +1741,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._fused_ffn_gate: Dict[Tuple, bool] = {}
         self._fused_ffn_disabled: bool = not _TRITON_AVAILABLE
 
+        # Same again for routing the q/k/v, out_proj and ffn_out projections
+        # through the Triton GEMM instead of cuBLAS (_triton_linear).
+        self._tri_linear_gate: Dict[Tuple, bool] = {}
+        self._tri_linear_disabled: bool = not _TRITON_AVAILABLE
+
     def _get_causal_allowed(self, seq_len: int, device: torch.device) -> torch.Tensor:
         key = (seq_len, device)
         cached = self._causal_allowed_cache.get(key)
@@ -1944,6 +2004,118 @@ class UserOptimizedTransformer(BaselineTransformer):
             return cached
         verdict = self._probe_fused_qkv_exact(x, valid_token_mask, mask_active, causal)
         self._fused_qkv_exact[key] = verdict
+        return verdict
+
+    def _probe_tri_linear(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+        use_tri_qk: bool,
+    ) -> bool:
+        """Decide whether the q/k/v, out_proj and ffn_out projections may run
+        on the Triton GEMM instead of cuBLAS.
+
+        Measured bit-exact at every shape with K <= 512 (see
+        _TRI_LINEAR_MIN_ROWS' table), so like the fused FFN projection this is
+        offered on the fp16/bf16 paths with a `torch.equal` bar, and on fp32
+        with the usual margin-scaled criterion against the exact fp32
+        reference.
+        """
+        if self._tri_linear_disabled or x.device.type != "cuda":
+            return False
+        if not _tri_linear_supported(x.shape[0] * x.shape[1]):
+            return False
+
+        try:
+            with torch.inference_mode():
+                candidate = self._forward_core(
+                    x, valid_token_mask, mask_active, causal, use_sdpa,
+                    use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                    use_short_attn, use_fused_ffn, use_tri_qk,
+                    use_tri_linear=True,
+                )
+                if x.dtype == torch.float32:
+                    reference = self._forward_core(
+                        x, valid_token_mask, mask_active, causal,
+                        use_sdpa=True, use_fp16_gemm=False,
+                        use_fused_qkv=False, layout=None, use_fused_ln=False,
+                        use_short_attn=False, use_fused_ffn=False,
+                        use_tri_qk=False, use_tri_linear=False,
+                    )
+                else:
+                    reference = self._forward_core(
+                        x, valid_token_mask, mask_active, causal, use_sdpa,
+                        use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                        use_short_attn, use_fused_ffn, use_tri_qk,
+                        use_tri_linear=False,
+                    )
+        except Exception:
+            self._tri_linear_disabled = True
+            return False
+
+        if x.dtype == torch.float32:
+            atol, rtol = _fp16_gemm_gate_thresholds()
+            abs_err = (candidate - reference).abs()
+            rel_err = abs_err / reference.abs().clamp_min(1e-12)
+            ok = ((abs_err <= _FP16_GEMM_GATE_MARGIN * atol)
+                  | (rel_err <= _FP16_GEMM_GATE_MARGIN * rtol))
+            passed = bool(torch.all(ok).item())
+            detail = (f"failed={int((~ok).sum().item())}/{ok.numel()} "
+                      f"max_abs={abs_err.max().item():.6g}")
+        else:
+            passed = bool(torch.equal(candidate, reference))
+            detail = f"differing={int((candidate != reference).sum().item())}/{reference.numel()}"
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            print(
+                f"[tri-linear-probe] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"{detail} -> "
+                f"{'ENABLE' if passed else 'DISABLE (cuBLAS)'} triton-linear",
+                file=sys.stderr,
+            )
+        return passed
+
+    def _resolve_tri_linear_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+        use_tri_qk: bool,
+        mask_kind: str,
+    ) -> bool:
+        """Probe once per configuration key and cache -- see
+        _probe_tri_linear."""
+        if self._tri_linear_disabled or x.device.type != "cuda":
+            return False
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind,
+               use_fp16_gemm, use_fused_qkv, layout is not None,
+               use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+        cached = self._tri_linear_gate.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._probe_tri_linear(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+            use_fused_ffn, use_tri_qk,
+        )
+        self._tri_linear_gate[key] = verdict
         return verdict
 
     def _probe_fused_ffn(
@@ -2508,6 +2680,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
         # Also a torch.equal sync, so likewise resolved out here rather
         # than inside _forward_core / a captured region.
+        use_tri_linear = self._resolve_tri_linear_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+            use_fused_ffn, False, mask_kind,
+        )
         use_tri_qk = self._resolve_tri_qk_enabled(
             x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
             use_fused_qkv, layout, use_fused_ln, use_short_attn,
@@ -2515,25 +2692,25 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
 
         if not self._graph_capture_allowed(x):
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
         if key in self._graph_unsupported:
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
         entry = self._graph_cache.get(key)
         if entry is not None:
             return self._replay_graph(entry, x, valid_token_mask, mask_kind)
 
         try:
-            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            entry = self._capture_graph(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, mask_kind, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
         except Exception:
             # Capture failed (or the CUDA context is unusable for capture on
             # this device/build). Never retry capture for this key; fall
             # back to eager permanently and keep serving correct results.
             self._graph_unsupported.add(key)
-            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+            return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
         self._graph_cache[key] = entry
         return self._replay_graph(entry, x, valid_token_mask, mask_kind)
@@ -2568,6 +2745,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_short_attn: bool = False,
         use_fused_ffn: bool = False,
         use_tri_qk: bool = False,
+        use_tri_linear: bool = False,
     ) -> _GraphCacheEntry:
         if self._graph_pool is None:
             self._graph_pool = torch.cuda.graph_pool_handle()
@@ -2609,12 +2787,12 @@ class UserOptimizedTransformer(BaselineTransformer):
             warmup_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warmup_stream):
                 for _ in range(3):
-                    self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+                    self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
             torch.cuda.current_stream().wait_stream(warmup_stream)
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self._graph_pool):
-                static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk)
+                static_output = self._forward_core(static_x, static_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
         return _GraphCacheEntry(
             graph=graph,
@@ -2840,6 +3018,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         use_short_attn: bool = False,
         use_fused_ffn: bool = False,
         use_tri_qk: bool = False,
+        use_tri_linear: bool = False,
     ) -> torch.Tensor:
         """The actual per-layer computation, identical in arithmetic/op-order
         to the original eager forward(). Takes `mask_active` as an
@@ -2882,7 +3061,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         first projection and its GELU with one _gemm_gelu_kernel launch.
         Unlike the other two, it can be bit-exact, so it is available on
         every dtype path.
+
+        `use_tri_linear` (see _resolve_tri_linear_enabled) routes the q/k/v,
+        out_proj and ffn_out projections through the same Triton GEMM with
+        its epilogue off, instead of cuBLAS. Also measured bit-exact at these
+        shapes, so also available on every dtype path.
         """
+        # Local alias so each projection site reads as one expression.
+        def _lin(t, w, b):
+            return _triton_linear(t, w, b) if use_tri_linear else F.linear(t, w, b)
         batch, seq_len, d_model = x.shape
 
         invalid_mask: Optional[torch.Tensor] = None
@@ -2952,7 +3139,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                 # context never round-trips through fp32 before out_proj.
                 # `normed` is already fp16 (see ln_dtype above).
                 fused_weight16, fused_bias16 = _get_fused_qkv_weights_fp16(attn)
-                qkv16 = F.linear(normed, fused_weight16, fused_bias16)
+                qkv16 = _lin(normed, fused_weight16, fused_bias16)
                 q16, k16, v16 = qkv16.split(d_model, dim=-1)
                 q16 = q16.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
                 k16 = k16.view(batch, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
@@ -2982,7 +3169,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                 # same arithmetic as the explicit .to(torch.float32) it
                 # replaces) and applies the attention output's padding mask
                 # via mask_delta.
-                attn_out = F.linear(context16, out_weight16, out_bias16)
+                attn_out = _lin(context16, out_weight16, out_bias16)
 
                 x, normed2 = self._ln_site(
                     x, attn_out, layer.norm2, ln_dtype,
@@ -3005,9 +3192,9 @@ class UserOptimizedTransformer(BaselineTransformer):
                     if use_fused_ffn:
                         hidden = _triton_gemm_gelu(normed2, ffn_in_weight16, ffn_in_bias16)
                     else:
-                        hidden = F.linear(normed2, ffn_in_weight16, ffn_in_bias16)
+                        hidden = _lin(normed2, ffn_in_weight16, ffn_in_bias16)
                         hidden = F.gelu(hidden, approximate="none")
-                    pending = F.linear(hidden, ffn_out_weight16, ffn_out_bias16)
+                    pending = _lin(hidden, ffn_out_weight16, ffn_out_bias16)
                 else:
                     pending = self._chunked_ffn_fp16gemm(
                         normed2, ffn_in_weight16, ffn_in_bias16, ffn_out_weight16, ffn_out_bias16, chunk_size
@@ -3034,16 +3221,16 @@ class UserOptimizedTransformer(BaselineTransformer):
                 # configuration; otherwise use_fused_qkv is False and the
                 # three-GEMM branch below runs instead.
                 fused_weight, fused_bias = _get_fused_qkv_weights(attn)
-                qkv = F.linear(normed, fused_weight, fused_bias)
+                qkv = _lin(normed, fused_weight, fused_bias)
                 q, k, v = qkv.split(d_model, dim=-1)
             else:
                 # fp16/bf16 where fusion was NOT proved bit-exact: issue the
                 # same three separate GEMMs the baseline uses, so the matmul
                 # reduction order -- and thus the fp16/bf16 rounding --
                 # matches bit-for-bit instead of merely "close enough".
-                q = attn.q_proj(normed)
-                k = attn.k_proj(normed)
-                v = attn.v_proj(normed)
+                q = _lin(normed, attn.q_proj.weight, attn.q_proj.bias)
+                k = _lin(normed, attn.k_proj.weight, attn.k_proj.bias)
+                v = _lin(normed, attn.v_proj.weight, attn.v_proj.bias)
 
             if layout is not None and not use_sdpa:
                 # Manual-math path only. The head transpose has to be
@@ -3108,7 +3295,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                     layout[1](context) if layout is not None
                     else context.transpose(1, 2).reshape(batch, seq_len, d_model)
                 )
-            attn_out = attn.out_proj(context)
+            attn_out = _lin(context, attn.out_proj.weight, attn.out_proj.bias)
 
             x, normed2 = self._ln_site(
                 x, attn_out, layer.norm2, ln_dtype,
@@ -3124,7 +3311,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                         normed2, layer.ffn_in.weight, layer.ffn_in.bias)
                 else:
                     hidden = F.gelu(layer.ffn_in(normed2), approximate="none")
-                pending = layer.ffn_out(hidden)
+                pending = _lin(hidden, layer.ffn_out.weight, layer.ffn_out.bias)
             else:
                 pending = self._chunked_ffn_fp32(normed2, layer.ffn_in, layer.ffn_out, chunk_size)
 
