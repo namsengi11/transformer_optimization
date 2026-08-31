@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure one query-tiled reference forward in an isolated CUDA process."""
+"""Measure one optimized batch-shard candidate in an isolated CUDA process."""
 from __future__ import annotations
 
 import argparse
@@ -17,12 +17,20 @@ from agent.tools._common import stamp
 from agent.tools.paths import agent_path
 
 
+DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
 def run(args: argparse.Namespace) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
+    dtype = DTYPES[args.dtype]
     config = B.TransformerConfig(
-        args.batch_size,
+        args.batch_shard,
         args.seq_len,
         args.d_model,
         args.heads,
@@ -36,40 +44,45 @@ def run(args: argparse.Namespace) -> dict:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    model = B.QueryTiledBaselineTransformer(
-        config, query_tile_size=args.query_tile, ffn_chunk_size=args.ffn_chunk
-    ).to(device=device, dtype=torch.float32).eval()
-    x, mask = B.generate_random_case(
-        config, device, torch.float32, args.seed, 0.0, 1.0
-    )
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-    started = torch.cuda.Event(enable_timing=True)
-    ended = torch.cuda.Event(enable_timing=True)
+    baseline = B.QueryTiledBaselineTransformer(config, query_tile_size=1)
+    model = B.UserOptimizedTransformer(config)
+    B.copy_model_weights(baseline, model, strict=True)
+    del baseline
+    model = model.to(device=device, dtype=dtype).eval()
+    x, mask = B.generate_random_case(config, device, dtype, args.seed, 0.0, 1.0)
     payload = {
         "provenance": stamp(
-            "agent/tools/streaming_tile_probe.py",
+            "agent/tools/streaming_shard_probe.py",
             {"invocation": " ".join(sys.argv)},
         ),
         "shape": {
-            "batch_size": args.batch_size,
+            "batch_shard": args.batch_shard,
             "seq_len": args.seq_len,
             "d_model": args.d_model,
             "heads": args.heads,
             "ffn_dim": args.ffn_dim,
             "layers": args.layers,
             "causal": args.causal,
+            "dtype": args.dtype,
         },
-        "query_tile": args.query_tile,
         "target_vram_fraction": args.target_vram_fraction,
         "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
     }
     try:
         with torch.inference_mode():
+            for _ in range(args.warmup):
+                model(x, mask)
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        started = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        with torch.inference_mode():
             started.record()
-            model(x, mask)
+            output = model(x, mask)
             ended.record()
         torch.cuda.synchronize(device)
+        del output
         peak_allocated = torch.cuda.max_memory_allocated(device)
         peak_reserved = torch.cuda.max_memory_reserved(device)
         total = payload["total_vram_bytes"]
@@ -96,15 +109,15 @@ def run(args: argparse.Namespace) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=100000)
-    parser.add_argument("--d-model", type=int, default=1024)
-    parser.add_argument("--heads", type=int, default=16)
-    parser.add_argument("--ffn-dim", type=int, default=1024)
-    parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--batch-shard", type=int, required=True)
+    parser.add_argument("--seq-len", type=int, required=True)
+    parser.add_argument("--d-model", type=int, required=True)
+    parser.add_argument("--heads", type=int, required=True)
+    parser.add_argument("--ffn-dim", type=int, required=True)
+    parser.add_argument("--layers", type=int, required=True)
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--query-tile", type=int, required=True)
-    parser.add_argument("--ffn-chunk", type=int, default=4096)
+    parser.add_argument("--dtype", choices=sorted(DTYPES), default="float32")
+    parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--target-vram-fraction", type=float, default=0.85)
     parser.add_argument("--output", type=agent_path, required=True)
@@ -115,7 +128,7 @@ def main() -> int:
     try:
         payload = run(args)
     except (RuntimeError, ValueError) as exc:
-        print(f"streaming tile probe refused: {exc}", file=sys.stderr)
+        print(f"streaming shard probe refused: {exc}", file=sys.stderr)
         return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, default=str))
@@ -123,8 +136,8 @@ def main() -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         print(
-            f"tile={payload['query_tile']} status={payload['status']} "
-            f"latency_ms={payload.get('latency_ms')} "
+            f"batch_shard={payload['shape']['batch_shard']} "
+            f"status={payload['status']} latency_ms={payload.get('latency_ms')} "
             f"peak_allocated={payload.get('peak_allocated_bytes')} "
             f"peak_reserved={payload.get('peak_reserved_bytes')}"
         )
