@@ -367,23 +367,18 @@ class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
             device=x.device,
             dtype=x.dtype,
         )
-        prob_workspace = torch.empty(
-            batch,
-            self.num_heads,
-            self.query_tile_size,
-            seq_len,
-            device=x.device,
-            dtype=torch.float32,
-        )
         context = torch.empty_like(q)
 
         for start in range(0, seq_len, self.query_tile_size):
             end = min(start + self.query_tile_size, seq_len)
-            # No causal query in this tile can observe keys at or after end.
-            # Omit that rectangular future region instead of multiplying it
-            # only to overwrite it with -inf. The in-tile upper triangle is
-            # still masked below, so full causal semantics are unchanged.
-            key_end = end if causal else seq_len
+            # Keep the key extent fixed across tiles. This intentionally does
+            # extra causal-upper-triangle work: progressively changing key
+            # extents fragment the CUDA allocator, while a preallocated
+            # softmax output adds a third live score-sized buffer because
+            # ATen's out= path still needs an internal result. The stable
+            # two-buffer form below reuses one fixed score allocation and one
+            # fixed-shape softmax result through the caching allocator.
+            key_end = seq_len
             query_count = end - start
             scores = score_workspace[:, :, :query_count, :key_end]
             torch.matmul(
@@ -400,8 +395,7 @@ class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
                 scores.masked_fill_(
                     ~valid_token_mask[:, None, None, :key_end], float("-inf")
                 )
-            probs_float = prob_workspace[:, :, :query_count, :key_end]
-            torch.softmax(scores.float(), dim=-1, out=probs_float)
+            probs_float = torch.softmax(scores.float(), dim=-1)
             if x.dtype == torch.float32:
                 probs = probs_float
             else:
@@ -4579,6 +4573,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-repeats", type=int, default=1)
     parser.add_argument("--streaming-rounds", type=int, default=1)
     parser.add_argument(
+        "--streaming-accuracy-only",
+        action="store_true",
+        help="validate a streamed long case without repeating its eager reference for timing",
+    )
+    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -4730,6 +4729,10 @@ def main() -> int:
         print("\nPerformance benchmark skipped because accuracy validation failed.")
         print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")
         return 2
+
+    if capacity_streaming and args.streaming_accuracy_only:
+        print("\nStreaming performance benchmark skipped by explicit accuracy-only request.")
+        return 0 if accuracy_passed else 2
 
     if capacity_streaming:
         benchmark_streaming_models(
