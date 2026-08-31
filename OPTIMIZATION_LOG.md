@@ -99,6 +99,7 @@ Each step was developed on its own branch and merged only after measurement.
 | 10 | investigated fp8 weight quantization -- **no change merged** | 1.189x (unchanged) | 5/5 |
 | 11 | two shape-specialized Triton kernels for the graded shapes | 1.172x default suite; **3.764x** geomean on the graded matrix | 5/5 + 13/13 (+ 60/60 sweep) |
 | 14 | block-triangular causal Q@K^T (bit-exact) | default suite unchanged; **1.068x** on long_causal_fp16 | 5/5 |
+| 16 | triangular causal scale+mask, persistent -inf buffer (bit-exact) | default suite unchanged; **1.112x** on long_causal_fp16 | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -1031,6 +1032,73 @@ it is not mistaken for a regression from this step: `--dtype bfloat16
 --batch-size 4 --seq-len 2048 --causal` FAILs on `main` as well, with
 `max_abs=0.046875` (~6 bf16 ulps). It reproduces identically with and
 without this step's change, so it predates it. Not diagnosed here.
+
+### Step 16 — triangular causal scale+mask (bit-exact)
+
+Step 14 stopped computing the above-diagonal half of `Q@K^T`. This step
+stops *writing* it too. The scale+mask kernel now writes only the
+block-lower-triangle: row `i` covers columns `[0, lim)` where
+`lim = min(((i//BR)+1)*BR, S)`, with `BR = 128`.
+
+Everything at or past `lim` is above the diagonal for row `i`, hence
+`-inf`. Rather than write it every call, it comes from a **persistent
+buffer** whose above-staircase region is filled with `-inf` once at
+allocation (`_get_tri_scaled_buffer`) and never touched again — not by any
+layer, not by any CUDA-graph replay. Every element the softmax then reads
+holds exactly the value the full-width kernel would have left:
+kernel-written below the staircase, `-inf` above it. Bit-exact by
+construction, and probed anyway.
+
+**The softmax is deliberately NOT made triangular**, and that is the whole
+reason the pre-filled buffer is load-bearing. Running softmax per block-row
+hands ATen a strided `[BR, lim)` slice, which drops it off its fast path:
+
+| (4,8,2048) | full-width | per-block-row, strided | per-block-row, contiguous |
+|---|---|---|---|
+| softmax | 1.87 ms | **2.39 ms** | 0.88 ms |
+
+i.e. the "half the work" version is *slower* than doing all of it. The
+contiguous column shows the win is real in principle (2.1x), but compacting
+to contiguous and scattering the result back to full width for `probs@V`
+costs more than the ~1 ms it saves. So softmax keeps reading whole rows —
+which is exactly why the above-staircase region has to actually contain
+`-inf`. Recorded because "make the softmax triangular too" is the obvious
+next idea and it does not work.
+
+`BR = 128` is uniform, chosen by measurement — smaller blocks skip strictly
+more of the upper half *and* the kernel runs best there, so there is no
+trade-off to tune:
+
+| shape | BR=128 | BR=256 | BR=512 |
+|---|---|---|---|
+| (4,8,2048) | **1.66x** | 1.22x | 1.18x |
+| (32,8,512) | **1.21x** | 1.13x | 0.99x |
+| (2,8,4096) | **1.22x** | 1.21x | 1.19x |
+| (16,16,256) | **1.08x** | 0.95x | — |
+
+Reuses step 14's gate unchanged (`use_tri_qk`): same preconditions —
+fp16/bf16 manual-math path, causal, CUDA, `seq_len >= 256` — and the same
+`torch.equal` probe now covers both transformations at once, so this adds
+no new plumbing and no second warmup cost.
+
+**Results** (optimized median, interleaved A/B against the same commit,
+2 reps each):
+
+| case | step 14 only | + step 16 | |
+|---|---|---|---|
+| long_causal_fp16 (B4 S2048) | 37.152 / 37.111 | **33.419 / 33.406** | **1.112x** |
+| big_causal_fp16 (B32 S512) | 33.595 / 33.651 | **32.491 / 32.218** | 1.038x |
+| causal_fp16 (B8 S128) | 1.5318 | 1.5364 | unchanged (gate declines) |
+
+All bit-exact: `max_abs=0`, `failed=0/41,943,040` over 5 trials at
+big_causal. Default suite 5/5, unchanged.
+
+**Memory note:** the persistent buffer is `[B,H,S,S]` in the model dtype —
+268 MB at long_causal_fp16 — held for the model's lifetime per
+(shape, dtype, block) rather than recycled between calls. It replaces the
+per-call `torch.empty_like` the full-width path allocated, so steady-state
+footprint is comparable, but it is not returned to the allocator between
+forwards.
 
 ## 4. Rejected after measurement
 
