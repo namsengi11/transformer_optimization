@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import torch
 
 import torch_transformer_benchmark as B
-from agent.tools._common import stamp
+from agent.tools._common import stamp, wait_for_idle
 from agent.tools.paths import agent_path
 
 
@@ -27,6 +27,9 @@ DTYPES = {
 def run(args: argparse.Namespace) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    idle = wait_for_idle(timeout_s=args.idle_timeout, verbose=False)
+    if not idle.get("idle"):
+        raise RuntimeError(idle.get("reason", "GPU did not become idle"))
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
     config = B.TransformerConfig(
@@ -66,6 +69,7 @@ def run(args: argparse.Namespace) -> dict:
             "dtype": args.dtype,
         },
         "target_vram_fraction": args.target_vram_fraction,
+        "idle_gate": idle,
         "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
     }
     try:
@@ -120,6 +124,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--target-vram-fraction", type=float, default=0.85)
+    parser.add_argument("--idle-timeout", type=int, default=900)
     parser.add_argument("--output", type=agent_path, required=True)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
