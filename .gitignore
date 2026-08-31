@@ -5,6 +5,7 @@ results_full.log
 agent/results/**/*.json
 agent/results/**/*.nsys-rep
 agent/results/**/*.sqlite
+agent/results/worktrees/
 agent/experiments/*/*.json
 
 # Read-only legacy optimization inputs retained at repository root.
