@@ -36,27 +36,33 @@ The gate is general and contains both kinds of pressure:
 
 `estimated_dense_bytes = 6*(B*S*D*element_bytes) + 2*(B*H*S^2*element_bytes) + 2*(B*S*ffn*element_bytes)`
 
-Streaming is selected when that estimate exceeds 65% of installed VRAM. It uses installed
+Streaming is selected when that estimate exceeds 85% of installed VRAM. It uses installed
 capacity, never current free memory, and does not match a benchmark name or fixed sequence
-length. `agent/tools/capacity_probe.py` selected the constant: equal `B*S=8192` shapes
+length. `agent/tools/capacity_probe.py` calibrated the estimate: equal `B*S=8192` shapes
 peaked at 76 MB for `B=64,S=128`, 312 MB for `B=8,S=1024`, and 2.26 GB for
 `B=1,S=8192`, demonstrating why `B*S` alone is insufficient. The row-6-like
 `B=10000,S=128` shape peaked at 10.51 GB and remains on the dense side of the gate.
 
 For a streamed row, inputs remain on the CPU and independent batch shards are transferred
-to CUDA. The eager reference tiles query rows while retaining all keys and values, so it
+to CUDA. Reference and optimized shards are selected independently: the optimized side uses
+the largest analytically feasible batch shard, while the eager reference searches batch/query
+work units under the same capacity ceiling. The reference retains all keys and values, so it
 still computes every full causal-attention relationship without an `[S,S]` allocation.
-The optimized model uses its memory-efficient SDPA path. Outputs are compared and released
-one shard at a time. Streaming timing includes transfers and uses explicit long-case counts
+Each optimized CPU shard is subdivided for the reference and compared against slices of the
+same optimized output. Streaming timing includes transfers and uses explicit long-case counts
 (`accuracy_trials=1`, `warmup=0`, `repeats=1`, `rounds=1`). There is no compiled-baseline
 ratio for a streamed row until an equivalent compiled streaming bar exists; report its
 optimized latency and MFU separately and exclude it from compiled-bar geomeans.
 
-The query-tiled reference reserves at most 10% of installed VRAM for its simultaneously
-live score/probability tile. A 20% calibration attempt selected 256 query rows for row 14
-but left insufficient `probs @ V` workspace; 10% selects 128 and leaves the remaining
-capacity for the resident shard, Q/K/V/context tensors, allocator fragmentation, and GEMM
-workspaces.
+The query-tiled reference no longer receives a fixed percentage of memory. The planner first
+subtracts estimated parameters and per-batch resident state from the 85% target, then sizes
+the simultaneous score/probability workspace from the remainder. A shape-independent 1.35x
+workspace reserve, measured with isolated candidate processes, covers allocator block rounding
+and GEMM workspace. Candidates are aligned to 64 query rows; there is no benchmark-name or
+exact-shape predicate. On row 14 this selects reference batch 1/query 448 and optimized batch
+2: query 448 measured 14.06 GB reserved (82.2%), query 512 measured 15.70 GB (91.8%) and was
+rejected, while optimized batch 2 measured 11.54 GB (67.5%) and batch 3 measured 15.43 GB
+(90.2%) and was rejected.
 
 ## Schema correction
 

@@ -13,6 +13,10 @@ reference query tile from `(B,S,D,H,FFN,dtype,installed VRAM)` under an 85% meas
 target will reduce long-case latency and raise optimized MFU versus the conservative shared
 65%/10% plan, without benchmark-name or exact-shape specialization.
 
+The capacity target is a ceiling, not a requirement to fill every byte. Candidate selection
+maximizes useful work under that ceiling and may deliberately use less memory when a larger
+candidate is slower or crosses the allocator-reserved limit.
+
 ## Evidence and prior art
 
 - Step 21 made canonical row 14 executable and passed 3,276,800,000 output elements with
