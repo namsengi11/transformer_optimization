@@ -352,23 +352,34 @@ class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))
-        key_positions = torch.arange(seq_len, device=x.device)
         contexts = []
 
         for start in range(0, seq_len, self.query_tile_size):
             end = min(start + self.query_tile_size, seq_len)
-            scores = torch.matmul(q[:, :, start:end], k.transpose(-2, -1)) * self.scale
+            # No causal query in this tile can observe keys at or after end.
+            # Omit that rectangular future region instead of multiplying it
+            # only to overwrite it with -inf. The in-tile upper triangle is
+            # still masked below, so full causal semantics are unchanged.
+            key_end = end if causal else seq_len
+            scores = (
+                torch.matmul(
+                    q[:, :, start:end],
+                    k[:, :, :key_end].transpose(-2, -1),
+                )
+                * self.scale
+            )
             if causal:
                 query_positions = torch.arange(start, end, device=x.device)[:, None]
+                key_positions = torch.arange(key_end, device=x.device)[None, :]
                 scores = scores.masked_fill(
-                    key_positions[None, :] > query_positions, float("-inf")
+                    key_positions > query_positions, float("-inf")
                 )
             if valid_token_mask is not None:
                 scores = scores.masked_fill(
-                    ~valid_token_mask[:, None, None, :], float("-inf")
+                    ~valid_token_mask[:, None, None, :key_end], float("-inf")
                 )
             probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
-            contexts.append(torch.matmul(probs, v))
+            contexts.append(torch.matmul(probs, v[:, :, :key_end]))
 
         context = torch.cat(contexts, dim=2)
         context = context.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
