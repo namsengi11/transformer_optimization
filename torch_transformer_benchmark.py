@@ -79,14 +79,11 @@ class TransformerConfig:
 # B=1/S=16384 peaked at 8.93 GB allocated / 12.97 GB reserved, while the
 # row-6-like B=10000/S=128 case peaked at 10.51 GB allocated and remains
 # dense on this 16 GiB card. 2*score + 6*input + 2*ffn tracks those peaks;
-# the observed safe admission boundary is 65% of installed VRAM. Never use
-# current free memory: the selected arithmetic must not depend on neighbours.
-_STREAMING_MEMORY_BUDGET_FRAC = 0.65
-# Row 14 with a 20% query budget selected Q=256 and left insufficient
-# cuBLAS workspace for probs@V after causal key trimming. A 10% budget selects
-# Q=128 on this card and reserves the other 90% for the resident stream,
-# Q/K/V/context tensors, allocator fragmentation, and GEMM workspaces.
-_STREAMING_QUERY_MEMORY_BUDGET_FRAC = 0.10
+# the original safe admission boundary was 65% of installed VRAM. Step 23
+# raises the measured-memory ceiling to 85% and derives both streaming axes
+# from the shape and the remaining capacity. Never use current free memory:
+# routing and tiling must not depend on neighbouring processes.
+_STREAMING_MEMORY_BUDGET_FRAC = 0.85
 
 
 def _capacity_terms_bytes(
@@ -3982,28 +3979,88 @@ def generate_random_case(
     return x, valid_token_mask
 
 
+@dataclass(frozen=True)
+class StreamingShardPlan:
+    reference_batch_shard: int
+    reference_query_tile: int
+    optimized_batch_shard: int
+    target_bytes: int
+    estimated_model_bytes: int
+
+
+def _estimated_streaming_model_bytes(
+    config: TransformerConfig, element_bytes: int
+) -> int:
+    """Estimate parameters for the simultaneously resident model pair."""
+    d_model = config.d_model
+    per_layer_elements = (
+        4 * d_model * d_model
+        + 2 * d_model * config.ffn_dim
+        + 9 * d_model
+        + config.ffn_dim
+    )
+    one_model_elements = config.num_layers * per_layer_elements + 2 * d_model
+    return 2 * one_model_elements * element_bytes
+
+
+def _power_of_two_floor(value: int) -> int:
+    return 1 << (max(1, int(value)).bit_length() - 1)
+
+
 def _streaming_shard_plan(
     config: TransformerConfig, dtype: torch.dtype, device: torch.device
-) -> Tuple[int, int]:
-    """Choose batch/query tiles solely from shape and installed capacity."""
+) -> StreamingShardPlan:
+    """Choose independent reference/optimized tiles from shape and capacity."""
     total_bytes = _installed_cuda_memory_bytes(device)
     if total_bytes is None:
         raise RuntimeError("capacity streaming requires installed CUDA memory information")
     element_bytes = torch.empty((), dtype=dtype).element_size()
+    target_bytes = int(total_bytes * _STREAMING_MEMORY_BUDGET_FRAC)
+    model_bytes = _estimated_streaming_model_bytes(config, element_bytes)
+    activation_budget = max(1, target_bytes - model_bytes)
     per_batch_resident = element_bytes * config.seq_len * (
         12 * config.d_model + 4 * config.ffn_dim
     )
-    resident_budget = int(total_bytes * _STREAMING_MEMORY_BUDGET_FRAC)
-    batch_shard = max(1, min(config.batch_size, resident_budget // per_batch_resident))
-
-    # The reference can have scores and probabilities live together.
-    query_budget = int(total_bytes * _STREAMING_QUERY_MEMORY_BUDGET_FRAC)
-    bytes_per_query = (
-        2 * batch_shard * config.num_heads * config.seq_len * element_bytes
+    optimized_batch_shard = max(
+        1, min(config.batch_size, activation_budget // per_batch_resident)
     )
-    max_queries = max(1, min(config.seq_len, query_budget // bytes_per_query))
-    query_tile = 1 << (int(max_queries).bit_length() - 1)
-    return int(batch_shard), int(query_tile)
+
+    # The reference can have a fixed score workspace and a dynamic probability
+    # tensor live together, hence the factor of two. Maximizing batch*query rows
+    # is a general proxy for GEMM occupancy and reduces reference tile launches.
+    best_reference = (0, 0, 1, 1)
+    max_reference_batch = min(config.batch_size, optimized_batch_shard)
+    for reference_batch_shard in range(1, max_reference_batch + 1):
+        resident_bytes = reference_batch_shard * per_batch_resident
+        available_query_bytes = activation_budget - resident_bytes
+        bytes_per_query = (
+            2
+            * reference_batch_shard
+            * config.num_heads
+            * config.seq_len
+            * element_bytes
+        )
+        max_queries = max(
+            1,
+            min(config.seq_len, available_query_bytes // max(1, bytes_per_query)),
+        )
+        query_tile = min(config.seq_len, _power_of_two_floor(max_queries))
+        candidate = (
+            reference_batch_shard * query_tile,
+            query_tile,
+            reference_batch_shard,
+            query_tile,
+        )
+        if candidate > best_reference:
+            best_reference = candidate
+
+    return StreamingShardPlan(
+        reference_batch_shard=int(best_reference[2]),
+        reference_query_tile=int(best_reference[3]),
+        optimized_batch_shard=int(optimized_batch_shard),
+        target_bytes=target_bytes,
+        estimated_model_bytes=model_bytes,
+    )
 
 
 def _generate_streaming_shard(
@@ -4192,9 +4249,10 @@ def run_streaming_accuracy_tests(
     input_scale: float,
     rtol: float,
     atol: float,
-    batch_shard: int,
+    reference_batch_shard: int,
+    optimized_batch_shard: int,
 ) -> bool:
-    """Out-of-core accuracy: compare and release one batch shard at a time."""
+    """Compare reference subshards with independently sized optimized shards."""
     print("\n=== Accuracy check (STREAMED) ===")
     print(f"criterion: abs_error <= {atol:g} OR relative_error <= {rtol:.2%}")
     all_passed = True
@@ -4210,8 +4268,8 @@ def run_streaming_accuracy_tests(
             trial_max_rel = 0.0
             trial_failed = 0
             trial_elements = 0
-            for start in range(0, config.batch_size, batch_shard):
-                shard_size = min(batch_shard, config.batch_size - start)
+            for start in range(0, config.batch_size, optimized_batch_shard):
+                shard_size = min(optimized_batch_shard, config.batch_size - start)
                 x_cpu, mask_cpu = _generate_streaming_shard(
                     config,
                     shard_size,
@@ -4222,19 +4280,30 @@ def run_streaming_accuracy_tests(
                 )
                 x = x_cpu.to(device)
                 mask = mask_cpu.to(device)
-                reference = baseline(x, mask).cpu()
-                del x, mask
-                x = x_cpu.to(device)
-                mask = mask_cpu.to(device)
                 candidate = optimized(x, mask).cpu()
-                result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
-                del x, mask, x_cpu, mask_cpu, reference, candidate
+                del x, mask
 
-                trial_passed &= result.passed
-                trial_max_abs = max(trial_max_abs, result.max_abs_error)
-                trial_max_rel = max(trial_max_rel, result.max_relative_error)
-                trial_failed += result.failed_elements
-                trial_elements += result.total_elements
+                for reference_start in range(0, shard_size, reference_batch_shard):
+                    reference_end = min(
+                        shard_size, reference_start + reference_batch_shard
+                    )
+                    reference_x = x_cpu[reference_start:reference_end].to(device)
+                    reference_mask = mask_cpu[reference_start:reference_end].to(device)
+                    reference = baseline(reference_x, reference_mask).cpu()
+                    result = compare_outputs(
+                        reference,
+                        candidate[reference_start:reference_end],
+                        rtol=rtol,
+                        atol=atol,
+                    )
+                    del reference_x, reference_mask, reference
+
+                    trial_passed &= result.passed
+                    trial_max_abs = max(trial_max_abs, result.max_abs_error)
+                    trial_max_rel = max(trial_max_rel, result.max_relative_error)
+                    trial_failed += result.failed_elements
+                    trial_elements += result.total_elements
+                del x_cpu, mask_cpu, candidate
 
             all_passed &= trial_passed
             global_max_abs = max(global_max_abs, trial_max_abs)
@@ -4427,15 +4496,16 @@ def benchmark_streaming_models(
     warmup: int,
     repeats: int,
     rounds: int,
-    batch_shard: int,
+    reference_batch_shard: int,
+    optimized_batch_shard: int,
 ) -> None:
     """Time full host-to-device/device-to-host streamed passes."""
     print("\n=== Performance benchmark (STREAMED) ===")
     print("timing includes shard transfers; fixed inputs remain resident on CPU")
     print(f"streaming protocol: warmup={warmup}, repeats={repeats}, rounds={rounds}")
     cpu_shards = []
-    for start in range(0, config.batch_size, batch_shard):
-        shard_size = min(batch_shard, config.batch_size - start)
+    for start in range(0, config.batch_size, optimized_batch_shard):
+        shard_size = min(optimized_batch_shard, config.batch_size - start)
         cpu_shards.append(
             _generate_streaming_shard(
                 config,
@@ -4447,32 +4517,34 @@ def benchmark_streaming_models(
             )
         )
 
-    def run_pass(model: nn.Module) -> float:
+    def run_pass(model: nn.Module, execution_batch_shard: int) -> float:
         torch.cuda.synchronize(device)
         started = time.perf_counter_ns()
         with torch.inference_mode():
             for x_cpu, mask_cpu in cpu_shards:
-                x = x_cpu.to(device)
-                mask = mask_cpu.to(device)
-                output_cpu = model(x, mask).cpu()
-                del x, mask, output_cpu
+                for start in range(0, x_cpu.shape[0], execution_batch_shard):
+                    end = min(x_cpu.shape[0], start + execution_batch_shard)
+                    x = x_cpu[start:end].to(device)
+                    mask = mask_cpu[start:end].to(device)
+                    output_cpu = model(x, mask).cpu()
+                    del x, mask, output_cpu
         torch.cuda.synchronize(device)
         return (time.perf_counter_ns() - started) / 1e6
 
     for _ in range(warmup):
-        run_pass(baseline)
-        run_pass(optimized)
+        run_pass(baseline, reference_batch_shard)
+        run_pass(optimized, optimized_batch_shard)
 
     baseline_samples = []
     optimized_samples = []
     for round_index in range(rounds):
         for _ in range(repeats):
             if round_index % 2 == 0:
-                baseline_samples.append(run_pass(baseline))
-                optimized_samples.append(run_pass(optimized))
+                baseline_samples.append(run_pass(baseline, reference_batch_shard))
+                optimized_samples.append(run_pass(optimized, optimized_batch_shard))
             else:
-                optimized_samples.append(run_pass(optimized))
-                baseline_samples.append(run_pass(baseline))
+                optimized_samples.append(run_pass(optimized, optimized_batch_shard))
+                baseline_samples.append(run_pass(baseline, reference_batch_shard))
 
     baseline_result = TimingResult(baseline_samples)
     optimized_result = TimingResult(optimized_samples)
@@ -4646,14 +4718,14 @@ def main() -> int:
     if capacity_streaming and (args.compile_baseline or args.compile_user):
         raise ValueError("compiled whole-model bars are not defined for streamed execution")
 
-    batch_shard = query_tile = None
+    streaming_plan = None
     if capacity_streaming:
-        batch_shard, query_tile = _streaming_shard_plan(config, dtype, device)
+        streaming_plan = _streaming_shard_plan(config, dtype, device)
 
     if capacity_streaming:
         baseline = QueryTiledBaselineTransformer(
             config,
-            query_tile_size=query_tile,
+            query_tile_size=streaming_plan.reference_query_tile,
             ffn_chunk_size=args.baseline_ffn_chunk_size,
         )
     elif args.chunk_baseline_ffn:
@@ -4689,7 +4761,12 @@ def main() -> int:
         total_bytes = _installed_cuda_memory_bytes(device)
         print(
             "execution=STREAMED | "
-            f"batch_shard={batch_shard} | query_tile={query_tile} | "
+            f"reference_batch_shard={streaming_plan.reference_batch_shard} | "
+            f"reference_query_tile={streaming_plan.reference_query_tile} | "
+            f"optimized_batch_shard={streaming_plan.optimized_batch_shard} | "
+            f"target_vram_fraction={_STREAMING_MEMORY_BUDGET_FRAC:.2f} | "
+            f"target_vram_bytes={streaming_plan.target_bytes} | "
+            f"estimated_model_bytes={streaming_plan.estimated_model_bytes} | "
             f"linear_bytes={linear_bytes} | score_bytes={score_bytes} | "
             f"estimated_dense_bytes={estimated_bytes} | "
             f"gpu_total_memory_bytes={total_bytes}"
@@ -4708,7 +4785,8 @@ def main() -> int:
             input_scale=args.input_scale,
             rtol=args.rtol,
             atol=args.atol,
-            batch_shard=batch_shard,
+            reference_batch_shard=streaming_plan.reference_batch_shard,
+            optimized_batch_shard=streaming_plan.optimized_batch_shard,
         )
     else:
         accuracy_passed = run_accuracy_tests(
@@ -4747,7 +4825,8 @@ def main() -> int:
             warmup=args.streaming_warmup,
             repeats=args.streaming_repeats,
             rounds=args.streaming_rounds,
-            batch_shard=batch_shard,
+            reference_batch_shard=streaming_plan.reference_batch_shard,
+            optimized_batch_shard=streaming_plan.optimized_batch_shard,
         )
     else:
         benchmark_models(
