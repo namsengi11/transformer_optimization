@@ -159,6 +159,10 @@ long-sequence streaming. Its two implementation commits remain isolated on
 **How to apply:** Close the active record, retain its branch, state that no evidence was
 collected, and give the replacement mechanism a new experiment number.
 
+Step 22 is a second application: its Inductor/Triton hypothesis was stopped before any code
+or measurement when general long-sequence autotuning became the explicit priority. It
+remains eligible for a later revisit.
+
 ## Rejections remain live evidence
 
 **Lesson:** A rejection is scoped to its measured mechanism and can be overturned only by new

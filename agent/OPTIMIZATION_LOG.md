@@ -30,6 +30,7 @@ starting hypothesis or comparison baseline. See `agent/docs/USER_MATRIX.md`.
 |---:|---|---|---|---:|---:|---|
 | 18 | DISCARDED | `opt/18-windows-text-decoding` | Loss-tolerant Windows subprocess decoding keeps GPU provenance alive | not run | not run | `agent/experiments/18-windows-text-decoding/quick.json` (untrusted) |
 | 20 | DISCARDED | `opt/20-inductor-fused-graph` | Admit a whole-core Inductor candidate behind an accuracy gate | not run | not run | superseded before measurement; branch retained |
+| 22 | DISCARDED | `opt/22-inductor-triton-erf` | Make fused FFN composable with whole-core Inductor | not run | not run | superseded before implementation; branch retained |
 
 ## 4. Agent rejection index
 
@@ -75,3 +76,11 @@ canonical row 14 and other capacity-bound long sequences executable through stre
 No latency, MFU, or accuracy claim is made. The implementation remains unmerged on
 `opt/20-inductor-fused-graph`; see
 `agent/experiments/20-inductor-fused-graph/result.md`.
+
+### Step 22: Inductor Triton compatibility
+
+The experiment was superseded before implementation when the user explicitly prioritized
+general long-sequence autotuning and an 85% installed-VRAM target. No numerical or
+performance claim is made. The hypothesis and documentation-only result remain on
+`opt/22-inductor-triton-erf`; see
+`agent/experiments/22-inductor-triton-erf/result.md`.
