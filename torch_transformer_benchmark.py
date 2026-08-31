@@ -85,10 +85,10 @@ class TransformerConfig:
 # routing and tiling must not depend on neighbouring processes.
 _STREAMING_MEMORY_BUDGET_FRAC = 0.85
 # Isolated step-23 sweeps found that fixed score/probability workspaces reserve
-# about 1.35x their tensor bytes once allocator block rounding and GEMM workspace
+# up to about 1.5x their tensor bytes once allocator block rounding and GEMM workspace
 # are included. This calibrated multiplier is shape-independent; the remaining
 # terms below still scale from the requested shape and dtype.
-_STREAMING_REFERENCE_WORKSPACE_RESERVE = 1.35
+_STREAMING_REFERENCE_WORKSPACE_RESERVE = 1.50
 _STREAMING_QUERY_ALIGNMENT = 64
 # Dense matrix rows reach their stable throughput region around 8192 tokens
 # per launch (for example B=64,S=128). More batch above that point needlessly

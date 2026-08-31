@@ -147,13 +147,13 @@ sized batch/query tiles, so it preserves full causal attention rather than
 substituting a local or sparse window. Its attention workspaces are reused and
 unreachable future causal-key tiles are skipped. The reference workspace consumes
 the capacity remaining after estimated parameters and resident activations, with a
-measured 1.35x reserve for allocator rounding and GEMM workspace. One optimized CPU
+measured 1.50x reserve for allocator rounding and GEMM workspace. One optimized CPU
 shard may therefore be subdivided into several reference shards; comparisons use
 the corresponding slices of the identical input and optimized output.
 
 For the extreme test shape `B=32, S=100000, D=1024, H=16, layers=2`, one float32
 dense attention-score tensor alone would require 20.48 TB. The input and output
-are each 13.1 GB. This shape selects reference batch 1/query 448 and optimized
+are each 13.1 GB. This shape selects reference batch 1/query 384 and optimized
 batch 1 on the pinned 16 GiB GPU. Reference query 512 reserves 91.8% and optimized
 batch 3 reserves 90.2%, both above the 85% target. Optimized batch 2 fits, but a
 clean end-to-end sweep measured 1.983 seconds per element versus 1.943 seconds for
