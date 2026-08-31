@@ -105,6 +105,45 @@ Each step was developed on its own branch and merged only after measurement.
 | 16 | triangular causal scale+mask, persistent -inf buffer (bit-exact) | default suite unchanged; **1.112x** on long_causal_fp16 | 5/5 |
 | 17 | q/k/v, out_proj and ffn_out on the Triton GEMM | **1.086x** on the graded matrix | 5/5 |
 
+**Current standing, re-measured after step 17** (both suites, idle GPU;
+the per-step figures above are each step's own contribution at the time it
+landed, and the graded-matrix headline in step 11 is superseded by this):
+
+| suite | geomean vs the compiled bar | accuracy |
+|---|---|---|
+| `default` (5 shapes) | **1.220x** | 5/5 PASS |
+| `user_matrix` (the graded matrix) | **4.726x** | 13/13 PASS |
+
+`default`: fp32 1.0968 ms (2.219x), fp16 1.5193 (0.993x), bf16 1.2989
+(1.378x), causal_fp16 1.5265 (0.961x), padded_fp16 1.6010 (0.928x); average
+MFU 59.58% against the bar's 55.80%.
+
+Graded matrix, optimized ms and speedup vs each row's own compiled baseline:
+
+| row | ms | vs bar | | row | ms | vs bar |
+|---|---|---|---|---|---|---|
+| 01_base | 0.3692 | 2.694x | | 08_seq1024 | 107.81 | 2.063x |
+| 02_batch1 | 0.0639 | **14.706x** | | 09_heads1 | 0.3859 | 2.299x |
+| 03_batch4 | 0.0741 | **12.981x** | | 10_heads2 | 0.3726 | 2.602x |
+| 04_batch16 | 0.1305 | 7.271x | | 11_heads16 | 0.4921 | 7.178x |
+| 05_batch128 | 0.8025 | 3.618x | | 12_ffn32 | 0.3437 | 2.907x |
+| 06_batch10000 | 97.90 | 3.528x | | 13_ffn1024 | 0.7653 | 3.267x |
+| 07_seq32 | 0.0644 | **14.607x** | | | | |
+
+Row 14 (`ffn_dim=100000`) reports `nan` in this suite and is excluded from
+the geomean: the *unmodified* reference OOMs at that shape, so it has to be
+run with step 5's `--chunk-baseline-ffn`. Measured that way it passes
+(0 of 33,554,432 elements failing, max_abs 0.0013) at 688.3 ms against a
+1453.9 ms chunked eager baseline.
+
+The very large ratios on rows 02/03/07 are the launch-overhead regime --
+those forwards are 64-74 us, where CUDA-graph replay plus the reduced kernel
+count dominates everything else, and MFU is correspondingly meaningless
+there (4.3% at batch=1: the GPU is nearly idle either way, we just stop
+waiting on the CPU sooner). The MFU column is the honest one for the larger
+rows: 63-65% at 08_seq1024 and 13_ffn1024.
+
+
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
 
