@@ -70,6 +70,58 @@ class TransformerConfig:
             raise ValueError("num_layers must be positive")
 
 
+# Step 21 capacity protocol, calibrated by
+# agent/experiments/21-long-sequence-streaming/capacity-b64-s128.json,
+# capacity-b8-s1024.json, capacity-b1-s8192.json, capacity-b1-s16384.json,
+# and capacity-row6-l1.json. Equal
+# B*S=8192 shapes peaked at 76 MB (S=128), 312 MB (S=1024), and 2.26 GB
+# (S=8192), proving that a token-count-only gate misses quadratic attention.
+# B=1/S=16384 peaked at 8.93 GB allocated / 12.97 GB reserved, while the
+# row-6-like B=10000/S=128 case peaked at 10.51 GB allocated and remains
+# dense on this 16 GiB card. 2*score + 6*input + 2*ffn tracks those peaks;
+# the observed safe admission boundary is 65% of installed VRAM. Never use
+# current free memory: the selected arithmetic must not depend on neighbours.
+_STREAMING_MEMORY_BUDGET_FRAC = 0.65
+_STREAMING_QUERY_MEMORY_BUDGET_FRAC = 0.20
+
+
+def _capacity_terms_bytes(
+    config: TransformerConfig, element_bytes: int
+) -> Tuple[int, int, int]:
+    rows = config.batch_size * config.seq_len
+    linear_bytes = rows * config.d_model * element_bytes
+    score_bytes = (
+        config.batch_size
+        * config.num_heads
+        * config.seq_len
+        * config.seq_len
+        * element_bytes
+    )
+    ffn_bytes = rows * config.ffn_dim * element_bytes
+    estimated_dense_bytes = 6 * linear_bytes + 2 * score_bytes + 2 * ffn_bytes
+    return linear_bytes, score_bytes, estimated_dense_bytes
+
+
+def _installed_cuda_memory_bytes(device: torch.device) -> Optional[int]:
+    if device.type != "cuda":
+        return None
+    try:
+        return int(torch.cuda.get_device_properties(device).total_memory)
+    except Exception:
+        return None
+
+
+def _capacity_streaming_required(
+    config: TransformerConfig, dtype: torch.dtype, device: torch.device
+) -> bool:
+    total_bytes = _installed_cuda_memory_bytes(device)
+    if total_bytes is None:
+        return False
+    element_bytes = torch.empty((), dtype=dtype).element_size()
+    _, _, estimated_dense_bytes = _capacity_terms_bytes(config, element_bytes)
+    return estimated_dense_bytes > int(total_bytes * _STREAMING_MEMORY_BUDGET_FRAC)
+
+
 class BaselineSelfAttention(nn.Module):
     """Explicit multi-head self-attention implemented with native PyTorch ops."""
 
@@ -274,6 +326,72 @@ class ChunkedBaselineTransformer(BaselineTransformer):
                 for _ in range(config.num_layers)
             ]
         )
+
+
+class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
+    """Dense reference attention with bounded score/probability residency.
+
+    K and V remain complete while only query rows are tiled. Every query is
+    still compared with every permitted key, so this preserves full causal
+    or padded attention. Parameters and state-dict keys are unchanged.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, query_tile_size: int) -> None:
+        super().__init__(d_model, num_heads)
+        if query_tile_size <= 0:
+            raise ValueError("query_tile_size must be positive")
+        self.query_tile_size = query_tile_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+        key_positions = torch.arange(seq_len, device=x.device)
+        contexts = []
+
+        for start in range(0, seq_len, self.query_tile_size):
+            end = min(start + self.query_tile_size, seq_len)
+            scores = torch.matmul(q[:, :, start:end], k.transpose(-2, -1)) * self.scale
+            if causal:
+                query_positions = torch.arange(start, end, device=x.device)[:, None]
+                scores = scores.masked_fill(
+                    key_positions[None, :] > query_positions, float("-inf")
+                )
+            if valid_token_mask is not None:
+                scores = scores.masked_fill(
+                    ~valid_token_mask[:, None, None, :], float("-inf")
+                )
+            probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+            contexts.append(torch.matmul(probs, v))
+
+        context = torch.cat(contexts, dim=2)
+        context = context.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
+        output = self.out_proj(context)
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+
+class QueryTiledBaselineTransformer(ChunkedBaselineTransformer):
+    """Capacity-bounded eager reference with an unchanged state dict."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        query_tile_size: int,
+        ffn_chunk_size: int = 4096,
+    ) -> None:
+        super().__init__(config, ffn_chunk_size=ffn_chunk_size)
+        for layer in self.layers:
+            layer.attention = QueryTiledBaselineSelfAttention(
+                config.d_model, config.num_heads, query_tile_size
+            )
 
 
 def _get_fused_qkv_weights(attn: "BaselineSelfAttention") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3827,6 +3945,52 @@ def generate_random_case(
     return x, valid_token_mask
 
 
+def _streaming_shard_plan(
+    config: TransformerConfig, dtype: torch.dtype, device: torch.device
+) -> Tuple[int, int]:
+    """Choose batch/query tiles solely from shape and installed capacity."""
+    total_bytes = _installed_cuda_memory_bytes(device)
+    if total_bytes is None:
+        raise RuntimeError("capacity streaming requires installed CUDA memory information")
+    element_bytes = torch.empty((), dtype=dtype).element_size()
+    per_batch_resident = element_bytes * config.seq_len * (
+        12 * config.d_model + 4 * config.ffn_dim
+    )
+    resident_budget = int(total_bytes * _STREAMING_MEMORY_BUDGET_FRAC)
+    batch_shard = max(1, min(config.batch_size, resident_budget // per_batch_resident))
+
+    # The reference can have scores and probabilities live together.
+    query_budget = int(total_bytes * _STREAMING_QUERY_MEMORY_BUDGET_FRAC)
+    bytes_per_query = (
+        2 * batch_shard * config.num_heads * config.seq_len * element_bytes
+    )
+    max_queries = max(1, min(config.seq_len, query_budget // bytes_per_query))
+    query_tile = 1 << (int(max_queries).bit_length() - 1)
+    return int(batch_shard), int(query_tile)
+
+
+def _generate_streaming_shard(
+    config: TransformerConfig,
+    batch_size: int,
+    dtype: torch.dtype,
+    seed: int,
+    padding_ratio: float,
+    input_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    shard_config = TransformerConfig(
+        batch_size=batch_size,
+        seq_len=config.seq_len,
+        d_model=config.d_model,
+        num_heads=config.num_heads,
+        ffn_dim=config.ffn_dim,
+        num_layers=config.num_layers,
+        causal=config.causal,
+    )
+    return generate_random_case(
+        shard_config, torch.device("cpu"), dtype, seed, padding_ratio, input_scale
+    )
+
+
 @dataclass
 class AccuracyResult:
     passed: bool
@@ -3970,6 +4134,82 @@ def run_accuracy_tests(
                     f"optimized={result.optimized_at_worst:.8g}"
                 )
                 print(f"  failed output feature dims={preview}{suffix}")
+
+    print(
+        f"summary: {'PASS' if all_passed else 'FAIL'} | "
+        f"max_abs={global_max_abs:.6g} | max_rel={global_max_rel:.6g} | "
+        f"failed={total_failed}/{total_elements}"
+    )
+    return all_passed
+
+
+def run_streaming_accuracy_tests(
+    baseline: nn.Module,
+    optimized: nn.Module,
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    trials: int,
+    seed: int,
+    padding_ratio: float,
+    input_scale: float,
+    rtol: float,
+    atol: float,
+    batch_shard: int,
+) -> bool:
+    """Out-of-core accuracy: compare and release one batch shard at a time."""
+    print("\n=== Accuracy check (STREAMED) ===")
+    print(f"criterion: abs_error <= {atol:g} OR relative_error <= {rtol:.2%}")
+    all_passed = True
+    global_max_abs = 0.0
+    global_max_rel = 0.0
+    total_failed = 0
+    total_elements = 0
+
+    with torch.inference_mode():
+        for trial in range(trials):
+            trial_passed = True
+            trial_max_abs = 0.0
+            trial_max_rel = 0.0
+            trial_failed = 0
+            trial_elements = 0
+            for start in range(0, config.batch_size, batch_shard):
+                shard_size = min(batch_shard, config.batch_size - start)
+                x_cpu, mask_cpu = _generate_streaming_shard(
+                    config,
+                    shard_size,
+                    dtype,
+                    seed + trial * config.batch_size + start,
+                    padding_ratio,
+                    input_scale,
+                )
+                x = x_cpu.to(device)
+                mask = mask_cpu.to(device)
+                reference = baseline(x, mask).cpu()
+                del x, mask
+                x = x_cpu.to(device)
+                mask = mask_cpu.to(device)
+                candidate = optimized(x, mask).cpu()
+                result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
+                del x, mask, x_cpu, mask_cpu, reference, candidate
+
+                trial_passed &= result.passed
+                trial_max_abs = max(trial_max_abs, result.max_abs_error)
+                trial_max_rel = max(trial_max_rel, result.max_relative_error)
+                trial_failed += result.failed_elements
+                trial_elements += result.total_elements
+
+            all_passed &= trial_passed
+            global_max_abs = max(global_max_abs, trial_max_abs)
+            global_max_rel = max(global_max_rel, trial_max_rel)
+            total_failed += trial_failed
+            total_elements += trial_elements
+            print(
+                f"trial {trial + 1:02d}/{trials}: "
+                f"{'PASS' if trial_passed else 'FAIL'} | "
+                f"max_abs={trial_max_abs:.6g} | max_rel={trial_max_rel:.6g} | "
+                f"failed={trial_failed}/{trial_elements}"
+            )
 
     print(
         f"summary: {'PASS' if all_passed else 'FAIL'} | "
@@ -4138,6 +4378,86 @@ def benchmark_models(
     print(f"speedup  : {speedup:.3f}x based on median latency")
 
 
+def benchmark_streaming_models(
+    baseline: nn.Module,
+    optimized: nn.Module,
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    padding_ratio: float,
+    input_scale: float,
+    warmup: int,
+    repeats: int,
+    rounds: int,
+    batch_shard: int,
+) -> None:
+    """Time full host-to-device/device-to-host streamed passes."""
+    print("\n=== Performance benchmark (STREAMED) ===")
+    print("timing includes shard transfers; fixed inputs remain resident on CPU")
+    print(f"streaming protocol: warmup={warmup}, repeats={repeats}, rounds={rounds}")
+    cpu_shards = []
+    for start in range(0, config.batch_size, batch_shard):
+        shard_size = min(batch_shard, config.batch_size - start)
+        cpu_shards.append(
+            _generate_streaming_shard(
+                config,
+                shard_size,
+                dtype,
+                seed + 100000 + start,
+                padding_ratio,
+                input_scale,
+            )
+        )
+
+    def run_pass(model: nn.Module) -> float:
+        torch.cuda.synchronize(device)
+        started = time.perf_counter_ns()
+        with torch.inference_mode():
+            for x_cpu, mask_cpu in cpu_shards:
+                x = x_cpu.to(device)
+                mask = mask_cpu.to(device)
+                output_cpu = model(x, mask).cpu()
+                del x, mask, output_cpu
+        torch.cuda.synchronize(device)
+        return (time.perf_counter_ns() - started) / 1e6
+
+    for _ in range(warmup):
+        run_pass(baseline)
+        run_pass(optimized)
+
+    baseline_samples = []
+    optimized_samples = []
+    for round_index in range(rounds):
+        for _ in range(repeats):
+            if round_index % 2 == 0:
+                baseline_samples.append(run_pass(baseline))
+                optimized_samples.append(run_pass(optimized))
+            else:
+                optimized_samples.append(run_pass(optimized))
+                baseline_samples.append(run_pass(baseline))
+
+    baseline_result = TimingResult(baseline_samples)
+    optimized_result = TimingResult(optimized_samples)
+    speedup = baseline_result.median_ms / optimized_result.median_ms
+    tokens = config.batch_size * config.seq_len
+    print(
+        f"baseline : median={baseline_result.median_ms:.4f} ms | "
+        f"mean={baseline_result.mean_ms:.4f} ms | "
+        f"p90={baseline_result.p90_ms:.4f} ms | "
+        f"min={baseline_result.min_ms:.4f} ms | "
+        f"throughput={tokens * 1000.0 / baseline_result.median_ms:.2f} token/s"
+    )
+    print(
+        f"optimized: median={optimized_result.median_ms:.4f} ms | "
+        f"mean={optimized_result.mean_ms:.4f} ms | "
+        f"p90={optimized_result.p90_ms:.4f} ms | "
+        f"min={optimized_result.min_ms:.4f} ms | "
+        f"throughput={tokens * 1000.0 / optimized_result.median_ms:.2f} token/s"
+    )
+    print(f"speedup  : {speedup:.3f}x based on median latency")
+
+
 def maybe_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
     if not enabled:
         return model
@@ -4204,6 +4524,18 @@ def parse_args() -> argparse.Namespace:
         help="row-chunk size for --chunk-baseline-ffn (rows = batch*seq_len)",
     )
     parser.add_argument(
+        "--capacity-streaming",
+        action="store_true",
+        help=(
+            "force the installed-VRAM-derived out-of-core protocol; normally "
+            "selected automatically when the static dense peak exceeds capacity"
+        ),
+    )
+    parser.add_argument("--streaming-accuracy-trials", type=int, default=1)
+    parser.add_argument("--streaming-warmup", type=int, default=0)
+    parser.add_argument("--streaming-repeats", type=int, default=1)
+    parser.add_argument("--streaming-rounds", type=int, default=1)
+    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -4230,6 +4562,12 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0 or args.benchmark_rounds <= 0:
         raise ValueError("repeats and benchmark_rounds must be positive")
+    if args.streaming_accuracy_trials <= 0:
+        raise ValueError("streaming_accuracy_trials must be positive")
+    if args.streaming_warmup < 0:
+        raise ValueError("streaming_warmup must be non-negative")
+    if args.streaming_repeats <= 0 or args.streaming_rounds <= 0:
+        raise ValueError("streaming repeats and rounds must be positive")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
@@ -4258,7 +4596,25 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
-    if args.chunk_baseline_ffn:
+    capacity_streaming = args.capacity_streaming or _capacity_streaming_required(
+        config, dtype, device
+    )
+    if capacity_streaming and device.type != "cuda":
+        raise ValueError("capacity streaming currently requires a CUDA device")
+    if capacity_streaming and (args.compile_baseline or args.compile_user):
+        raise ValueError("compiled whole-model bars are not defined for streamed execution")
+
+    batch_shard = query_tile = None
+    if capacity_streaming:
+        batch_shard, query_tile = _streaming_shard_plan(config, dtype, device)
+
+    if capacity_streaming:
+        baseline = QueryTiledBaselineTransformer(
+            config,
+            query_tile_size=query_tile,
+            ffn_chunk_size=args.baseline_ffn_chunk_size,
+        )
+    elif args.chunk_baseline_ffn:
         baseline = ChunkedBaselineTransformer(
             config, ffn_chunk_size=args.baseline_ffn_chunk_size
         )
@@ -4283,39 +4639,84 @@ def main() -> int:
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
+    if capacity_streaming:
+        element_bytes = torch.empty((), dtype=dtype).element_size()
+        linear_bytes, score_bytes, estimated_bytes = _capacity_terms_bytes(
+            config, element_bytes
+        )
+        total_bytes = _installed_cuda_memory_bytes(device)
+        print(
+            "execution=STREAMED | "
+            f"batch_shard={batch_shard} | query_tile={query_tile} | "
+            f"linear_bytes={linear_bytes} | score_bytes={score_bytes} | "
+            f"estimated_dense_bytes={estimated_bytes} | "
+            f"gpu_total_memory_bytes={total_bytes}"
+        )
 
-    accuracy_passed = run_accuracy_tests(
-        baseline=baseline,
-        optimized=optimized,
-        config=config,
-        device=device,
-        dtype=dtype,
-        trials=args.accuracy_trials,
-        seed=args.seed,
-        padding_ratio=args.padding_ratio,
-        input_scale=args.input_scale,
-        rtol=args.rtol,
-        atol=args.atol,
-    )
+    if capacity_streaming:
+        accuracy_passed = run_streaming_accuracy_tests(
+            baseline=baseline,
+            optimized=optimized,
+            config=config,
+            device=device,
+            dtype=dtype,
+            trials=args.streaming_accuracy_trials,
+            seed=args.seed,
+            padding_ratio=args.padding_ratio,
+            input_scale=args.input_scale,
+            rtol=args.rtol,
+            atol=args.atol,
+            batch_shard=batch_shard,
+        )
+    else:
+        accuracy_passed = run_accuracy_tests(
+            baseline=baseline,
+            optimized=optimized,
+            config=config,
+            device=device,
+            dtype=dtype,
+            trials=args.accuracy_trials,
+            seed=args.seed,
+            padding_ratio=args.padding_ratio,
+            input_scale=args.input_scale,
+            rtol=args.rtol,
+            atol=args.atol,
+        )
 
     if not accuracy_passed and not args.benchmark_on_failure:
         print("\nPerformance benchmark skipped because accuracy validation failed.")
         print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")
         return 2
 
-    benchmark_models(
-        baseline=baseline,
-        optimized=optimized,
-        config=config,
-        device=device,
-        dtype=dtype,
-        seed=args.seed,
-        padding_ratio=args.padding_ratio,
-        input_scale=args.input_scale,
-        warmup=args.warmup,
-        repeats=args.repeats,
-        rounds=args.benchmark_rounds,
-    )
+    if capacity_streaming:
+        benchmark_streaming_models(
+            baseline=baseline,
+            optimized=optimized,
+            config=config,
+            device=device,
+            dtype=dtype,
+            seed=args.seed,
+            padding_ratio=args.padding_ratio,
+            input_scale=args.input_scale,
+            warmup=args.streaming_warmup,
+            repeats=args.streaming_repeats,
+            rounds=args.streaming_rounds,
+            batch_shard=batch_shard,
+        )
+    else:
+        benchmark_models(
+            baseline=baseline,
+            optimized=optimized,
+            config=config,
+            device=device,
+            dtype=dtype,
+            seed=args.seed,
+            padding_ratio=args.padding_ratio,
+            input_scale=args.input_scale,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            rounds=args.benchmark_rounds,
+        )
     return 0 if accuracy_passed else 2
 
 

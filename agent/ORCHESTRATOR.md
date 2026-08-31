@@ -30,9 +30,12 @@ matrix measurement.
 
 These rules are not optimization candidates.
 
-1. Accuracy is always judged against eager `BaselineTransformer`, with zero failing elements
-   under `abs(user-reference) <= 0.002 OR abs(user-reference) <= 0.02*abs(reference)`. Never
-   use the compiled baseline as the numerical reference.
+1. Accuracy is judged against eager `BaselineTransformer` where its calibrated dense peak
+   fits installed VRAM. Above that boundary, use the step-21 query-tiled eager reference,
+   which preserves full attention and has been cross-checked against the dense reference on
+   feasible long-sequence surrogates. Both require zero failing elements under
+   `abs(user-reference) <= 0.002 OR abs(user-reference) <= 0.02*abs(reference)`. Never use
+   the compiled baseline as the numerical reference.
 2. Measurement goes through `agent/tools/` or it does not count. Every number in a hypothesis,
    result, commit, digest, or dashboard names the tool and artifact that produced it. Do not
    write inline timing loops, one-off profiler snippets, or ad-hoc A/B scripts. A missing
@@ -70,10 +73,11 @@ These rules are not optimization candidates.
 Promote step N only when all conditions hold:
 
 1. `agent/tools/bench.py --suite default` reports 5/5 PASS.
-2. `agent/tools/bench.py --suite user_matrix` reports 13/13 PASS for executable rows 1-13.
-   `14_extreme` remains recorded as `PREFLIGHT_BLOCKED` because its dense score-tensor lower
-   bound exceeds device capacity; never launch its allocation. The exact schema and block
-   calculation are in `agent/docs/USER_MATRIX.md`.
+2. `agent/tools/bench.py --suite user_matrix` reports 14/14 PASS. Capacity-safe rows use the
+   dense eager reference; over-budget rows such as `14_extreme` report `STREAMED` and use
+   batch/query streaming. A streamed row has no compiled-baseline ratio and is excluded from
+   compiled-bar geomeans. The gate, long-case counts, and schema are in
+   `agent/docs/USER_MATRIX.md`.
 3. At least one of these is true:
    - median `optimized_ms` improves on at least one suite with non-overlapping min/max ranges
      over at least three independent runs, and no suite regresses more than 2%; or
@@ -84,7 +88,9 @@ Promote step N only when all conditions hold:
 Discard otherwise. A no-code investigation still consumes a step number and gets recorded.
 Judge `optimized_ms`, never `speedup_vs_compiled`; the compiled bar varies substantially
 across processes. Compare MFU only at the same executed precision, using
-`fp16_gemm_enabled` for fp32 rows that actually ran fp16 tensor-core GEMMs.
+   `fp16_gemm_enabled` for fp32 rows that actually ran fp16 tensor-core GEMMs. Judge streamed
+   rows by accuracy, optimized latency, and same-precision MFU, not by a nonexistent compiled
+   streaming bar.
 
 ## 3. Serial state machine
 
@@ -261,7 +267,7 @@ STEP NN | MERGED|DISCARDED | short description   [GPU time]
 ---------------------------------------------------------
 CLAIM    falsifiable mechanism
 RESULT   default before -> after | matrix before -> after
-         MFU before -> after     | accuracy 5/5 + 13/13
+         MFU before -> after     | accuracy 5/5 + 14/14 (streamed rows labeled)
 DETAIL   strongest mechanism measurement [tool + artifact]
 EXCLUDED cases and evidence, or none
 =========================================================

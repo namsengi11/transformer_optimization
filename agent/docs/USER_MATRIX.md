@@ -26,11 +26,31 @@ All rows use the harness-default `float32` dtype.
 
 ## Execution policy
 
-Rows 1-13 are the executable scored matrix. Row 14 remains in the suite definition so the
-protocol is complete, but it is structurally infeasible for the dense-attention baseline on
-the pinned 16 GiB GPU: one fp32 `[batch, heads, seq_len, seq_len]` score tensor alone would
-require 20.48 TB (about 18.6 TiB). The benchmark must report it as `PREFLIGHT_BLOCKED`; it
-must not start a child process that attempts the allocation.
+All 14 rows are executable. Rows whose estimated dense peak fits the calibrated installed-
+VRAM budget use the ordinary dense protocol. A row above the budget is labeled `STREAMED`
+and uses the capacity protocol described below. On the pinned 16 GiB GPU this applies to
+row 14: one fp32 `[batch, heads, seq_len, seq_len]` score tensor alone would require
+20.48 TB (about 18.6 TiB), while its input and output are each 13.1 GB.
+
+The gate is general and contains both kinds of pressure:
+
+`estimated_dense_bytes = 6*(B*S*D*element_bytes) + 2*(B*H*S^2*element_bytes) + 2*(B*S*ffn*element_bytes)`
+
+Streaming is selected when that estimate exceeds 65% of installed VRAM. It uses installed
+capacity, never current free memory, and does not match a benchmark name or fixed sequence
+length. `agent/tools/capacity_probe.py` selected the constant: equal `B*S=8192` shapes
+peaked at 76 MB for `B=64,S=128`, 312 MB for `B=8,S=1024`, and 2.26 GB for
+`B=1,S=8192`, demonstrating why `B*S` alone is insufficient. The row-6-like
+`B=10000,S=128` shape peaked at 10.51 GB and remains on the dense side of the gate.
+
+For a streamed row, inputs remain on the CPU and independent batch shards are transferred
+to CUDA. The eager reference tiles query rows while retaining all keys and values, so it
+still computes every full causal-attention relationship without an `[S,S]` allocation.
+The optimized model uses its memory-efficient SDPA path. Outputs are compared and released
+one shard at a time. Streaming timing includes transfers and uses explicit long-case counts
+(`accuracy_trials=1`, `warmup=0`, `repeats=1`, `rounds=1`). There is no compiled-baseline
+ratio for a streamed row until an equivalent compiled streaming bar exists; report its
+optimized latency and MFU separately and exclude it from compiled-bar geomeans.
 
 ## Schema correction
 

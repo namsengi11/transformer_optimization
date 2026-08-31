@@ -88,9 +88,14 @@ def run_suite(suite: str, tag: str, runs: int, timeout: int, bar_reps: int,
         }
         statuses = {row.get("status", "EXECUTED") for row in raw_runs}
         preflight_blocked = statuses == {"PREFLIGHT_BLOCKED"}
+        streamed = statuses == {"STREAMED"}
         case_payload: dict[str, Any] = {
             "name": case,
-            "status": "PREFLIGHT_BLOCKED" if preflight_blocked else "EXECUTED",
+            "status": (
+                "PREFLIGHT_BLOCKED" if preflight_blocked
+                else "STREAMED" if streamed
+                else "EXECUTED"
+            ),
             "accuracy_pass": (
                 None if preflight_blocked
                 else all(row.get("accuracy") == "PASS" for row in raw_runs)
@@ -119,7 +124,9 @@ def run_suite(suite: str, tag: str, runs: int, timeout: int, bar_reps: int,
                 }
         output_cases.append(case_payload)
 
-    executed_cases = [case for case in output_cases if case["status"] == "EXECUTED"]
+    executed_cases = [
+        case for case in output_cases if case["status"] in ("EXECUTED", "STREAMED")
+    ]
     blocked_cases = [case for case in output_cases if case["status"] == "PREFLIGHT_BLOCKED"]
     valid_speedups = [case["summaries"]["speedup_vs_compiled"]["median"] for case in executed_cases
                       if "speedup_vs_compiled" in case["summaries"]]

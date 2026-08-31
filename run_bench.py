@@ -138,15 +138,18 @@ def _gpu_total_memory_bytes() -> int | None:
 
 
 def preflight_case(extra: list[str]) -> dict | None:
-    """Reject a shape whose baseline score tensor cannot fit on the GPU.
+    """Select the installed-VRAM streaming protocol before launching a child.
 
-    BaselineSelfAttention explicitly materializes one fp32/fp16/bf16
-    ``[batch, heads, seq_len, seq_len]`` score tensor. This is a strict lower
-    bound, not a fitted peak-memory estimate: if that tensor alone exceeds
-    total device memory, launching the child can only OOM.
+    Step 21 calibrated this estimate with ``agent/tools/capacity_probe.py``.
+    The linear term protects input/output/QKV/FFN residency while the
+    quadratic term protects dense attention. A B*S-only gate is insufficient:
+    equal-token probes ranged from 76 MB to 2.26 GB as S grew.
     """
     shape = resolve_shape(extra)
     element_bytes = 4 if shape["dtype"] == "float32" else 2
+    rows = shape["batch_size"] * shape["seq_len"]
+    linear_bytes = rows * shape["d_model"] * element_bytes
+    ffn_bytes = rows * shape["ffn_dim"] * element_bytes
     score_bytes = (
         shape["batch_size"]
         * shape["heads"]
@@ -155,14 +158,21 @@ def preflight_case(extra: list[str]) -> dict | None:
         * element_bytes
     )
     device_bytes = _gpu_total_memory_bytes()
-    if device_bytes is None or score_bytes <= device_bytes:
+    estimated_dense_bytes = 6 * linear_bytes + 2 * score_bytes + 2 * ffn_bytes
+    budget_bytes = int(device_bytes * 0.65) if device_bytes is not None else None
+    if budget_bytes is None or estimated_dense_bytes <= budget_bytes:
         return None
     return {
-        "status": "PREFLIGHT_BLOCKED",
+        "status": "STREAMING_REQUIRED",
         "reason": (
-            "one dense baseline attention-score tensor exceeds total GPU memory"
+            "estimated dense peak exceeds the calibrated installed-VRAM budget"
         ),
+        "rows_b_times_s": rows,
+        "linear_tensor_bytes": linear_bytes,
         "score_tensor_bytes": score_bytes,
+        "ffn_tensor_bytes": ffn_bytes,
+        "estimated_dense_bytes": estimated_dense_bytes,
+        "streaming_budget_bytes": budget_bytes,
         "gpu_total_memory_bytes": device_bytes,
     }
 
@@ -309,40 +319,22 @@ def main() -> int:
     results = []
     for name, extra in cases.items():
         preflight = preflight_case(extra)
+        streaming = preflight is not None
         if preflight is not None:
-            shape = resolve_shape(extra)
-            row = {
-                "name": name,
-                "cmd": " ".join([str(SCRIPT), *extra]),
-                "status": preflight["status"],
-                "accuracy": None,
-                "max_abs": None,
-                "max_rel": None,
-                "eager_baseline_ms": None,
-                "compiled_baseline_ms": None,
-                "optimized_ms": None,
-                "speedup_vs_compiled": None,
-                "speedup_vs_eager": None,
-                "mfu_optimized": None,
-                "mfu_compiled_baseline": None,
-                "fp16_gemm_enabled": None,
-                "wall_s": 0.0,
-                "shape": shape,
-                "preflight": preflight,
-            }
-            results.append(row)
             print(
-                f"[run_bench] {name} PREFLIGHT_BLOCKED: "
-                f"{preflight['score_tensor_bytes']} score bytes > "
-                f"{preflight['gpu_total_memory_bytes']} GPU bytes",
+                f"[run_bench] {name} STREAMING_REQUIRED: "
+                f"estimated={preflight['estimated_dense_bytes']} bytes > "
+                f"budget={preflight['streaming_budget_bytes']} bytes",
                 flush=True,
             )
-            continue
-        print(f"[run_bench] {name} (correctness vs eager baseline) ...", flush=True)
-        acc_run = run_case(name, extra, False, args.compile_user, args.timeout)
+        reference_name = "query-tiled eager baseline" if streaming else "eager baseline"
+        print(f"[run_bench] {name} (correctness vs {reference_name}) ...", flush=True)
+        acc_run = run_case(
+            name, extra, False, args.compile_user and not streaming, args.timeout
+        )
 
         bar = None
-        if not args.skip_speed_bar:
+        if not args.skip_speed_bar and not streaming:
             # The compiled baseline has ~30% run-to-run variance across processes
             # (observed: padded_fp16 bar 2.03 ms vs 1.53 ms on identical code).
             # Take the FASTEST bar over `--bar-reps` runs, which is the
@@ -368,7 +360,7 @@ def main() -> int:
         r = {
             "name": name,
             "cmd": acc_run.get("cmd"),
-            "status": "EXECUTED",
+            "status": "STREAMED" if streaming else "EXECUTED",
             "accuracy": acc_run.get("accuracy"),
             "max_abs": acc_run.get("max_abs"),
             "max_rel": acc_run.get("max_rel"),
@@ -382,6 +374,8 @@ def main() -> int:
             "mfu_compiled_baseline": compute_mfu(shape, bar),
             "fp16_gemm_enabled": acc_run.get("fp16_gemm_enabled"),
             "wall_s": acc_run["wall_s"],
+            "shape": shape,
+            "preflight": preflight,
         }
         results.append(r)
         print(f"[run_bench]   acc={r['accuracy']} opt={opt_ms}ms "
@@ -426,12 +420,12 @@ def main() -> int:
         avg_mfu_bar = statistics.fmean(mfu_bar_ok)
         print(f"average MFU (compiled baseline) across {len(mfu_bar_ok)}/{len(results)} "
               f"cases: {100*avg_mfu_bar:.2f}%")
-    executed = [r for r in results if r["status"] == "EXECUTED"]
+    executed = [r for r in results if r["status"] in ("EXECUTED", "STREAMED")]
     n_pass = sum(1 for r in executed if r["accuracy"] == "PASS")
-    n_blocked = sum(1 for r in results if r["status"] == "PREFLIGHT_BLOCKED")
+    n_streamed = sum(1 for r in results if r["status"] == "STREAMED")
     print(f"accuracy: {n_pass}/{len(executed)} executed cases PASS vs eager baseline")
-    if n_blocked:
-        print(f"preflight: {n_blocked}/{len(results)} cases structurally blocked")
+    if n_streamed:
+        print(f"streaming: {n_streamed}/{len(results)} cases used capacity streaming")
 
     outdir = Path("results")
     outdir.mkdir(exist_ok=True)
