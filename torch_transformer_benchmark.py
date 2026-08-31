@@ -90,6 +90,10 @@ _STREAMING_MEMORY_BUDGET_FRAC = 0.85
 # terms below still scale from the requested shape and dtype.
 _STREAMING_REFERENCE_WORKSPACE_RESERVE = 1.35
 _STREAMING_QUERY_ALIGNMENT = 64
+# Dense matrix rows reach their stable throughput region around 8192 tokens
+# per launch (for example B=64,S=128). More batch above that point needlessly
+# raises residency for already-long sequences and can reduce per-token latency.
+_STREAMING_OPTIMIZED_TOKEN_TARGET = 8192
 
 
 def _capacity_terms_bytes(
@@ -3990,6 +3994,7 @@ class StreamingShardPlan:
     reference_batch_shard: int
     reference_query_tile: int
     optimized_batch_shard: int
+    optimized_capacity_batch_shard: int
     target_bytes: int
     estimated_model_bytes: int
 
@@ -4033,8 +4038,16 @@ def _streaming_shard_plan(
     per_batch_resident = element_bytes * config.seq_len * (
         12 * config.d_model + 4 * config.ffn_dim
     )
-    optimized_batch_shard = max(
+    optimized_capacity_batch_shard = max(
         1, min(config.batch_size, activation_budget // per_batch_resident)
+    )
+    saturation_batch_shard = max(
+        1,
+        (config.seq_len + _STREAMING_OPTIMIZED_TOKEN_TARGET - 1)
+        // config.seq_len,
+    )
+    optimized_batch_shard = min(
+        optimized_capacity_batch_shard, saturation_batch_shard
     )
 
     # The reference can have a fixed score workspace and a dynamic probability
@@ -4071,6 +4084,7 @@ def _streaming_shard_plan(
         reference_batch_shard=int(best_reference[2]),
         reference_query_tile=int(best_reference[3]),
         optimized_batch_shard=int(optimized_batch_shard),
+        optimized_capacity_batch_shard=int(optimized_capacity_batch_shard),
         target_bytes=target_bytes,
         estimated_model_bytes=model_bytes,
     )
@@ -4777,6 +4791,8 @@ def main() -> int:
             f"reference_batch_shard={streaming_plan.reference_batch_shard} | "
             f"reference_query_tile={streaming_plan.reference_query_tile} | "
             f"optimized_batch_shard={streaming_plan.optimized_batch_shard} | "
+            "optimized_capacity_batch_shard="
+            f"{streaming_plan.optimized_capacity_batch_shard} | "
             f"target_vram_fraction={_STREAMING_MEMORY_BUDGET_FRAC:.2f} | "
             f"target_vram_bytes={streaming_plan.target_bytes} | "
             f"estimated_model_bytes={streaming_plan.estimated_model_bytes} | "

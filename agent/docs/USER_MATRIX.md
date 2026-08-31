@@ -45,8 +45,9 @@ peaked at 76 MB for `B=64,S=128`, 312 MB for `B=8,S=1024`, and 2.26 GB for
 
 For a streamed row, inputs remain on the CPU and independent batch shards are transferred
 to CUDA. Reference and optimized shards are selected independently: the optimized side uses
-the largest analytically feasible batch shard, while the eager reference searches batch/query
-work units under the same capacity ceiling. The reference retains all keys and values, so it
+the smallest capacity-safe shard that reaches the calibrated 8192-token throughput region,
+while the eager reference searches batch/query work units under the same capacity ceiling.
+The reference retains all keys and values, so it
 still computes every full causal-attention relationship without an `[S,S]` allocation.
 Each optimized CPU shard is subdivided for the reference and compared against slices of the
 same optimized output. Streaming timing includes transfers and uses explicit long-case counts
@@ -60,9 +61,10 @@ the simultaneous score/probability workspace from the remainder. A shape-indepen
 workspace reserve, measured with isolated candidate processes, covers allocator block rounding
 and GEMM workspace. Candidates are aligned to 64 query rows; there is no benchmark-name or
 exact-shape predicate. On row 14 this selects reference batch 1/query 448 and optimized batch
-2: query 448 measured 14.06 GB reserved (82.2%), query 512 measured 15.70 GB (91.8%) and was
-rejected, while optimized batch 2 measured 11.54 GB (67.5%) and batch 3 measured 15.43 GB
-(90.2%) and was rejected.
+1: query 448 measured 14.06 GB reserved (82.2%), while query 512 measured 15.70 GB (91.8%)
+and was rejected. Optimized batch 2 is capacity-safe but its clean end-to-end latency was
+1.983 seconds per element versus 1.943 seconds for batch 1, so filling more memory was slower;
+batch 3 measured 15.43 GB (90.2%) and was rejected on capacity.
 
 ## Schema correction
 

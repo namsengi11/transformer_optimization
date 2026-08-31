@@ -140,8 +140,9 @@ Installed capacity is used rather than current free memory, so routing is stable
 and does not depend on other GPU processes.
 
 The input remains on CPU and independent batch shards are transferred to CUDA.
-The optimized side uses memory-efficient SDPA and its own capacity-derived batch
-shard. The naive reference retains all keys and values but evaluates independently
+The optimized side uses memory-efficient SDPA and the smallest capacity-safe batch
+shard that reaches the calibrated 8192-token throughput region. The naive reference
+retains all keys and values but evaluates independently
 sized batch/query tiles, so it preserves full causal attention rather than
 substituting a local or sparse window. Its attention workspaces are reused and
 unreachable future causal-key tiles are skipped. The reference workspace consumes
@@ -153,10 +154,12 @@ the corresponding slices of the identical input and optimized output.
 For the extreme test shape `B=32, S=100000, D=1024, H=16, layers=2`, one float32
 dense attention-score tensor alone would require 20.48 TB. The input and output
 are each 13.1 GB. This shape selects reference batch 1/query 448 and optimized
-batch 2 on the pinned 16 GiB GPU. Isolated probes reject the next candidates because
-reference query 512 reserves 91.8% and optimized batch 3 reserves 90.2%, both above
-the 85% target. The path is validated on feasible long-sequence surrogates; the
-current full-shape validation status is recorded with the step-23 experiment.
+batch 1 on the pinned 16 GiB GPU. Reference query 512 reserves 91.8% and optimized
+batch 3 reserves 90.2%, both above the 85% target. Optimized batch 2 fits, but a
+clean end-to-end sweep measured 1.983 seconds per element versus 1.943 seconds for
+batch 1; it is rejected because extra residency reduced throughput. The path is
+validated on feasible long-sequence surrogates; the current full-shape validation
+status is recorded with the step-23 experiment.
 
 ## Latest test-shape benchmark
 
