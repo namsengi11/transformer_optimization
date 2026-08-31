@@ -3,7 +3,7 @@
 - Outcome: MERGED
 - Branch: `opt/23-streaming-autotune`
 - Base SHA: `ba933aa7a8f1b0db398898ecd9416510c936b5f5`
-- Measured SHA: `ed662364f18fcaebe2e3d1c05b9d4539457b470f`
+- Measured SHA: `d115f513fb999cc4ba2ff5a3b06cd59a86b72a2b`
 - Completed UTC: 2026-08-31T21:28:00Z
 - GPU time: about 8 minutes of isolated probes plus correctness runs
 
@@ -16,14 +16,13 @@ throughput region because filling more memory made row 14 slower.
 
 ## Accuracy
 
-- Final row-14-dimension shard (`B=1,S=100000,D=1024,H=16,F=1024,L=2`) passed
-  102,400,000/102,400,000 elements with `max_abs=0.000811517` at unchanged
+- Final canonical row 14 (`B=32,S=100000,D=1024,H=16,F=1024,L=2`) passed
+  3,276,800,000/3,276,800,000 elements with `max_abs=0.000951409` at unchanged
   `atol=0.002, rtol=0.02`.
 - A split-shard long case (`B=2,S=7000,D=1024,H=64`) selected reference batch 1 and
   optimized batch 2 and passed 14,336,000/14,336,000 elements (`max_abs=0.000523984`).
-- Step 21 already validated the complete canonical `B=32` row: zero failures across
-  3,276,800,000 elements. Step 23 revalidated the changed scheduling at canonical
-  sequence/model dimensions; batch elements are independent.
+- A separate canonical-dimension `B=1` check also passed 102,400,000 elements with
+  `max_abs=0.000811517`.
 
 ## Latency, MFU, and memory
 
@@ -49,8 +48,9 @@ to power-of-two candidates and a shape-independent 1.50x reference workspace res
 
 Clean-checkout artifacts are under
 `agent/results/worktrees/step23-measure/agent/experiments/23-streaming-autotune/`:
-`row14-opt-final.json`, `row14-ref-final.json`, `surrogate-s7000-ref-q2048.json`, and
-`surrogate-s7000-ref-final.json`. Final probes used the idle gate and report
+`correctness-row14-full-final.json`, `correctness-row14-shard-final.json`,
+`correctness-split-final.json`, `row14-opt-final.json`, `row14-ref-final.json`,
+`surrogate-s7000-ref-q2048.json`, and `surrogate-s7000-ref-final.json`. Final probes used the idle gate and report
 `git_tree_dirty=false`.
 
 Compile, canonical matrix schema, a small streamed case, the split long case, and the

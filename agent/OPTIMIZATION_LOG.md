@@ -93,8 +93,8 @@ reference and optimized SDPA shards from shape, dtype, and device capacity. A ca
 8192-token saturation target prevents larger optimized shards when they reduce per-token
 latency. Row 14 selects reference batch 1/query 256 and optimized batch 1.
 
-At measured SHA `ed662364`, the canonical-dimension shard passed 102,400,000 elements with
-zero failures and `max_abs=0.000811517`. The optimized end-to-end median was 1911.8657 ms
+At measured SHA `d115f51`, canonical row 14 passed all 3,276,800,000 elements with zero
+failures and `max_abs=0.000951409`. The optimized end-to-end median was 1911.8657 ms
 per batch element (90.50% MFU), with 5.81 GB peak reserved; the reference reserved 9.53 GB.
 See `agent/experiments/23-streaming-autotune/result.md` for the cross-shape sweep and clean
 measurement paths.

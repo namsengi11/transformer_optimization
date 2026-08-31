@@ -3,7 +3,7 @@
 - Status: PROMOTED
 - Branch: `opt/23-streaming-autotune`
 - Pinned main SHA: `ba933aa7a8f1b0db398898ecd9416510c936b5f5`
-- Pinned experiment SHA: `ed662364f18fcaebe2e3d1c05b9d4539457b470f`
+- Pinned experiment SHA: `d115f513fb999cc4ba2ff5a3b06cd59a86b72a2b`
 - Started UTC: 2026-08-31T20:29:27Z
 
 ## Claim
