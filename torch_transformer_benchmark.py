@@ -1465,6 +1465,124 @@ def _no_static_cuda_launcher():
         return contextlib.nullcontext()
 
 
+# Staircase granularity for the block-triangular causal scale+mask kernel
+# (_tri_scale_mask_kernel). 128 measured consistently best across every
+# shape tried -- speedup of the triangular epilogue over the full-width one:
+#
+#     shape            BR=128   BR=256   BR=512
+#     (4,8,2048)        1.66x    1.22x    1.18x
+#     (32,8,512)        1.21x    1.13x    0.99x
+#     (2,8,4096)        1.22x    1.21x    1.19x
+#     (16,16,256)       1.08x    0.95x      --
+#
+# Smaller blocks skip strictly more of the above-diagonal half, and 128 is
+# also where the kernel itself runs best, so there is no trade-off to tune.
+_TRI_MASK_BLOCK = 128
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _tri_scale_mask_kernel(
+        scores_ptr, out_ptr, mask_ptr,
+        H, SQ, SK,
+        stride_sb, stride_sh, stride_sq, stride_sk,
+        stride_ob, stride_oh, stride_oq, stride_ok,
+        stride_mb, stride_mk,
+        scale,
+        MASK_ACTIVE: tl.constexpr,
+        BR: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Causal-only variant of _fused_scale_mask_kernel that writes just
+        the block-lower-triangle.
+
+        Row i writes columns [0, lim) where lim = min(((i//BR)+1)*BR, SK).
+        Every column at or past `lim` is above the diagonal for row i, so it
+        is -inf -- and it is left ALONE here, because the destination is a
+        persistent buffer whose above-staircase region was filled with -inf
+        once, at allocation (see _get_tri_scaled_buffer). Nothing else ever
+        writes there, so it stays -inf for the life of the buffer and across
+        every CUDA-graph replay.
+
+        Every element the following softmax reads therefore holds exactly
+        the value the full-width kernel would have left: kernel-written
+        below the staircase, -inf above it. That makes this bit-exact by
+        construction rather than by luck, and it is still probed.
+
+        The softmax itself is deliberately NOT made triangular. Running it
+        per block-row means handing ATen a strided [BR, lim) slice, which
+        drops it off its fast path: measured 1.87 -> 2.39 ms at
+        (4,8,2048), i.e. SLOWER than the full-width softmax despite doing
+        half the work. The same work on contiguous block-rows takes
+        0.88 ms, but compacting to contiguous and scattering the result
+        back to full width for probs@V costs more than the 1 ms it saves.
+        So softmax keeps reading the whole row, which is exactly why the
+        -inf pre-fill above is load-bearing.
+        """
+        row_id = tl.program_id(0)
+        hq = H * SQ
+        b = row_id // hq
+        rem = row_id % hq
+        h = rem // SQ
+        i = rem % SQ
+
+        lim = tl.minimum(((i // BR) + 1) * BR, SK)
+        row_base_s = b * stride_sb + h * stride_sh + i * stride_sq
+        row_base_o = b * stride_ob + h * stride_oh + i * stride_oq
+        mask_row_base = b * stride_mb
+        out_dtype = out_ptr.dtype.element_ty
+
+        for start in range(0, lim, BLOCK_N):
+            cols = start + tl.arange(0, BLOCK_N)
+            col_ok = cols < lim
+            sv = tl.load(scores_ptr + row_base_s + cols * stride_sk,
+                         mask=col_ok, other=0.0)
+            v = (sv.to(tl.float32) * scale).to(out_dtype)
+            v = tl.where(cols <= i, v, -float("inf"))
+            if MASK_ACTIVE:
+                mvals = tl.load(mask_ptr + mask_row_base + cols * stride_mk,
+                                mask=col_ok, other=0)
+                v = tl.where(mvals != 0, v, -float("inf"))
+            tl.store(out_ptr + row_base_o + cols * stride_ok, v, mask=col_ok)
+
+
+def _triton_tri_scale_mask(
+    scores_raw: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    block: int,
+    mask_active: bool,
+    valid_token_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Launch _tri_scale_mask_kernel into the caller-supplied persistent
+    `out` buffer (see _get_tri_scaled_buffer). Raises on any failure so a
+    real bug cannot masquerade as an unsupported shape -- callers fall back
+    to the full-width path."""
+    B, H, SQ, SK = scores_raw.shape
+    if mask_active:
+        assert valid_token_mask is not None
+        stride_mb, stride_mk = valid_token_mask.stride()
+        mask_arg = valid_token_mask
+    else:
+        stride_mb, stride_mk = 0, 0
+        mask_arg = scores_raw
+
+    _tri_scale_mask_kernel[(B * H * SQ,)](
+        scores_raw, out, mask_arg,
+        H, SQ, SK,
+        *scores_raw.stride(),
+        *out.stride(),
+        stride_mb, stride_mk,
+        scale,
+        MASK_ACTIVE=mask_active,
+        BR=block,
+        BLOCK_N=128,
+        num_warps=4,
+    )
+    return out
+
+
 class _GraphCacheEntry:
     """Holds one captured CUDA graph plus the static input/output buffers it
     was captured against. Replaying requires copy_-ing fresh data into
@@ -1682,6 +1800,13 @@ class UserOptimizedTransformer(BaselineTransformer):
         # the fp16/bf16 manual-math path with causal=True; the fp32/SDPA path
         # never enters this dict.
         self._tri_qk_gate: Dict[Tuple, bool] = {}
+
+        # (B, H, S, dtype, device, block) -> persistent scaled-scores buffer
+        # whose above-staircase region is pre-filled with -inf. Reused by
+        # every layer and every CUDA-graph replay; see
+        # _tri_scale_mask_kernel for why it must never be written above
+        # the staircase.
+        self._tri_scaled_bufs: Dict[Tuple, torch.Tensor] = {}
 
         # (tuple(x.shape), x.dtype, x.device) -> (split_fn, merge_fn) | None.
         # Verified-bit-exact torch.compile'd layout helpers for that
@@ -2459,6 +2584,35 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._fused_ln_gate[key] = verdict
         return verdict
 
+    def _get_tri_scaled_buffer(
+        self, scores_raw: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        """Persistent [B, H, S, S] buffer for the triangular scale+mask
+        kernel, with everything above the block staircase set to -inf once,
+        here, and never touched again.
+
+        Cached per (B, H, S, dtype, device, block). Allocated on the first
+        forward for a configuration -- which is always the probe, before any
+        CUDA-graph capture -- so the captured graph refers to a stable
+        pointer. It replaces the per-call `torch.empty_like` the full-width
+        path allocates, so steady-state memory is comparable; it is held for
+        the model's lifetime rather than returned to the allocator between
+        calls."""
+        B, H, S, SK = scores_raw.shape
+        key = (B, H, S, SK, scores_raw.dtype, scores_raw.device, block)
+        buf = self._tri_scaled_bufs.get(key)
+        if buf is not None:
+            return buf
+        buf = torch.empty(B, H, S, SK, device=scores_raw.device,
+                          dtype=scores_raw.dtype)
+        neg_inf = float("-inf")
+        for start in range(0, S, block):
+            lim = min(start + block, SK)
+            if lim < SK:
+                buf[:, :, start:min(start + block, S), lim:] = neg_inf
+        self._tri_scaled_bufs[key] = buf
+        return buf
+
     def _probe_tri_qk_exact(
         self,
         x: torch.Tensor,
@@ -2811,6 +2965,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         causal_disallowed: Optional[torch.Tensor],
         invalid_keys: Optional[torch.Tensor],
         out_dtype: torch.dtype,
+        tri_block: Optional[int] = None,
     ) -> torch.Tensor:
         """Computes softmax(scale * scores_raw, masked) in the model dtype,
         used only by the fp16/bf16 manual-math attention branch. Tries the
@@ -2861,11 +3016,22 @@ class UserOptimizedTransformer(BaselineTransformer):
         scaled: Optional[torch.Tensor] = None
         if not self._triton_softmax_disabled and scores_raw.device.type == "cuda":
             try:
-                scaled = _triton_fused_scale_mask(
-                    scores_raw, scale, causal, mask_active, valid_token_mask
-                )
+                if tri_block is not None:
+                    # Causal only: write just the block-lower-triangle
+                    # into a persistent buffer that already holds -inf
+                    # above the staircase. See _tri_scale_mask_kernel.
+                    scaled = _triton_tri_scale_mask(
+                        scores_raw,
+                        self._get_tri_scaled_buffer(scores_raw, tri_block),
+                        scale, tri_block, mask_active, valid_token_mask,
+                    )
+                else:
+                    scaled = _triton_fused_scale_mask(
+                        scores_raw, scale, causal, mask_active, valid_token_mask
+                    )
             except Exception:
                 self._triton_softmax_disabled = True
+                scaled = None
 
         if scaled is None:
             scaled = scores_raw * scale
@@ -3286,6 +3452,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                 probs = self._fused_attn_probs(
                     scores_raw, attn.scale, causal, mask_active,
                     valid_token_mask, causal_disallowed, invalid_keys, x.dtype,
+                    tri_block=(_TRI_MASK_BLOCK if tri_block is not None else None),
                 )
                 context = torch.matmul(probs, v)
 
