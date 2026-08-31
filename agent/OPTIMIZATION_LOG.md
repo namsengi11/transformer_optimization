@@ -31,6 +31,7 @@ starting hypothesis or comparison baseline. See `agent/docs/USER_MATRIX.md`.
 | 18 | DISCARDED | `opt/18-windows-text-decoding` | Loss-tolerant Windows subprocess decoding keeps GPU provenance alive | not run | not run | `agent/experiments/18-windows-text-decoding/quick.json` (untrusted) |
 | 20 | DISCARDED | `opt/20-inductor-fused-graph` | Admit a whole-core Inductor candidate behind an accuracy gate | not run | not run | superseded before measurement; branch retained |
 | 22 | DISCARDED | `opt/22-inductor-triton-erf` | Make fused FFN composable with whole-core Inductor | not run | not run | superseded before implementation; branch retained |
+| 23 | MERGED | `opt/23-streaming-autotune` | General 85%-VRAM streaming autotuner | dense unchanged | row 14 executable | `agent/experiments/23-streaming-autotune/result.md` |
 
 ## 4. Agent rejection index
 
@@ -84,3 +85,16 @@ general long-sequence autotuning and an 85% installed-VRAM target. No numerical 
 performance claim is made. The hypothesis and documentation-only result remain on
 `opt/22-inductor-triton-erf`; see
 `agent/experiments/22-inductor-triton-erf/result.md`.
+
+### Step 23: general 85%-VRAM streaming autotuner
+
+Capacity routing now uses an 85% installed-memory ceiling and independently sizes the eager
+reference and optimized SDPA shards from shape, dtype, and device capacity. A calibrated
+8192-token saturation target prevents larger optimized shards when they reduce per-token
+latency. Row 14 selects reference batch 1/query 256 and optimized batch 1.
+
+At measured SHA `ed662364`, the canonical-dimension shard passed 102,400,000 elements with
+zero failures and `max_abs=0.000811517`. The optimized end-to-end median was 1911.8657 ms
+per batch element (90.50% MFU), with 5.81 GB peak reserved; the reference reserved 9.53 GB.
+See `agent/experiments/23-streaming-autotune/result.md` for the cross-shape sweep and clean
+measurement paths.
