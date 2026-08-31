@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -13,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import torch
 
 import torch_transformer_benchmark as B
-from agent.tools._common import stamp
+from agent.tools._common import stamp, wait_for_idle
 from agent.tools.paths import agent_path
 
 
@@ -38,6 +39,9 @@ def summarize(result: B.AccuracyResult) -> dict:
 def run(args: argparse.Namespace) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    idle = wait_for_idle(timeout_s=args.idle_timeout, verbose=False)
+    if not idle.get("idle"):
+        raise RuntimeError(idle.get("reason", "GPU did not become idle"))
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
     config = B.TransformerConfig(
@@ -55,6 +59,90 @@ def run(args: argparse.Namespace) -> dict:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    shape = {
+        "batch_size": args.batch_size,
+        "seq_len": args.seq_len,
+        "d_model": args.d_model,
+        "heads": args.heads,
+        "ffn_dim": args.ffn_dim,
+        "layers": args.layers,
+        "causal": args.causal,
+        "dtype": args.dtype,
+    }
+
+    if args.streamed:
+        plan = B._streaming_shard_plan(config, dtype, device)
+        tiled = B.QueryTiledBaselineTransformer(
+            config,
+            query_tile_size=plan.reference_query_tile,
+            ffn_chunk_size=args.ffn_chunk,
+        )
+        optimized = B.UserOptimizedTransformer(config)
+        B.copy_model_weights(tiled, optimized, strict=True)
+        tiled = tiled.to(device=device, dtype=dtype).eval()
+        optimized = optimized.to(device=device, dtype=dtype).eval()
+        total_elements = failed_elements = 0
+        max_abs_error = max_relative_error = mean_abs_weighted = 0.0
+        with torch.inference_mode():
+            for start in range(0, config.batch_size, plan.optimized_batch_shard):
+                shard_size = min(
+                    plan.optimized_batch_shard, config.batch_size - start
+                )
+                x_cpu, mask_cpu = B._generate_streaming_shard(
+                    config,
+                    shard_size,
+                    dtype,
+                    args.seed + start,
+                    0.0,
+                    1.0,
+                )
+                candidate = optimized(
+                    x_cpu.to(device), mask_cpu.to(device)
+                ).cpu()
+                for ref_start in range(0, shard_size, plan.reference_batch_shard):
+                    ref_end = min(
+                        shard_size, ref_start + plan.reference_batch_shard
+                    )
+                    reference = tiled(
+                        x_cpu[ref_start:ref_end].to(device),
+                        mask_cpu[ref_start:ref_end].to(device),
+                    ).cpu()
+                    result = B.compare_outputs(
+                        reference,
+                        candidate[ref_start:ref_end],
+                        args.rtol,
+                        args.atol,
+                    )
+                    total_elements += result.total_elements
+                    failed_elements += result.failed_elements
+                    max_abs_error = max(max_abs_error, result.max_abs_error)
+                    max_relative_error = max(
+                        max_relative_error, result.max_relative_error
+                    )
+                    mean_abs_weighted += (
+                        result.mean_abs_error * result.total_elements
+                    )
+        streamed_result = {
+            "passed": failed_elements == 0,
+            "total_elements": total_elements,
+            "failed_elements": failed_elements,
+            "max_abs_error": max_abs_error,
+            "max_relative_error": max_relative_error,
+            "mean_abs_error": mean_abs_weighted / max(1, total_elements),
+        }
+        return {
+            "provenance": stamp(
+                "agent/tools/streaming_correctness.py",
+                {"invocation": " ".join(sys.argv)},
+            ),
+            "idle_gate": idle,
+            "shape": shape,
+            "mode": "capacity_streamed",
+            "plan": dataclasses.asdict(plan),
+            "streamed_result": streamed_result,
+            "passed": streamed_result["passed"],
+        }
 
     dense = B.BaselineTransformer(config)
     tiled = B.QueryTiledBaselineTransformer(
@@ -80,16 +168,9 @@ def run(args: argparse.Namespace) -> dict:
             "agent/tools/streaming_correctness.py",
             {"invocation": " ".join(sys.argv)},
         ),
-        "shape": {
-            "batch_size": args.batch_size,
-            "seq_len": args.seq_len,
-            "d_model": args.d_model,
-            "heads": args.heads,
-            "ffn_dim": args.ffn_dim,
-            "layers": args.layers,
-            "causal": args.causal,
-            "dtype": args.dtype,
-        },
+        "idle_gate": idle,
+        "shape": shape,
+        "mode": "dense_cross_check",
         "query_tile": args.query_tile,
         "tiled_vs_dense": summarize(tiled_result),
         "optimized_vs_dense": summarize(optimized_result),
@@ -112,6 +193,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--atol", type=float, default=0.002)
     parser.add_argument("--rtol", type=float, default=0.02)
+    parser.add_argument("--streamed", action="store_true")
+    parser.add_argument("--idle-timeout", type=int, default=900)
     parser.add_argument("--output", type=agent_path, required=True)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -125,11 +208,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
     else:
-        print(
-            f"passed={payload['passed']} "
-            f"tiled={payload['tiled_vs_dense']} "
-            f"optimized={payload['optimized_vs_dense']}"
-        )
+        print(f"passed={payload['passed']} mode={payload['mode']}")
     return 0 if payload["passed"] else 3
 
 

@@ -159,7 +159,7 @@ def preflight_case(extra: list[str]) -> dict | None:
     )
     device_bytes = _gpu_total_memory_bytes()
     estimated_dense_bytes = 6 * linear_bytes + 2 * score_bytes + 2 * ffn_bytes
-    budget_bytes = int(device_bytes * 0.65) if device_bytes is not None else None
+    budget_bytes = int(device_bytes * 0.85) if device_bytes is not None else None
     if budget_bytes is None or estimated_dense_bytes <= budget_bytes:
         return None
     return {

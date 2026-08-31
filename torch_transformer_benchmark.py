@@ -4028,10 +4028,26 @@ def _streaming_shard_plan(
     element_bytes = torch.empty((), dtype=dtype).element_size()
     target_bytes = int(total_bytes * _STREAMING_MEMORY_BUDGET_FRAC)
     model_bytes = _estimated_streaming_model_bytes(config, element_bytes)
-    activation_budget = max(1, target_bytes - model_bytes)
+    activation_budget = target_bytes - model_bytes
     per_batch_resident = element_bytes * config.seq_len * (
         12 * config.d_model + 4 * config.ffn_dim
     )
+    minimum_query_workspace = int(
+        2
+        * config.num_heads
+        * config.seq_len
+        * element_bytes
+        * _STREAMING_REFERENCE_WORKSPACE_RESERVE
+    )
+    minimum_streaming_bytes = (
+        model_bytes + per_batch_resident + minimum_query_workspace
+    )
+    if minimum_streaming_bytes > target_bytes:
+        raise RuntimeError(
+            "capacity streaming cannot fit its minimum reference shard under "
+            f"the {_STREAMING_MEMORY_BUDGET_FRAC:.0%} VRAM ceiling: "
+            f"required={minimum_streaming_bytes}, target={target_bytes}"
+        )
     optimized_capacity_batch_shard = max(
         1, min(config.batch_size, activation_budget // per_batch_resident)
     )
