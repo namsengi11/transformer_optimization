@@ -1,4 +1,16 @@
 __pycache__/
 *.pyc
-results/
+/results/
 results_full.log
+agent/results/**/*.json
+agent/results/**/*.nsys-rep
+agent/results/**/*.sqlite
+agent/experiments/*/*.json
+
+# Read-only legacy optimization inputs retained at repository root.
+/14_extreme_optonly.txt
+/14_extreme_ro.txt
+/KERNEL_METHODS_ANALYSIS.md
+/SOTA_AGENT_KERNEL_METHODS.md
+/bench_equal_bar.py
+/main_5060ti_equalbar_results.txt
