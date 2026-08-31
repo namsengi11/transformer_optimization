@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -79,14 +80,17 @@ def run(args: argparse.Namespace) -> dict:
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
-        started = torch.cuda.Event(enable_timing=True)
-        ended = torch.cuda.Event(enable_timing=True)
+        samples_ms = []
         with torch.inference_mode():
-            started.record()
-            output = model(x, mask)
-            ended.record()
-        torch.cuda.synchronize(device)
-        del output
+            for _ in range(args.repeats):
+                started = torch.cuda.Event(enable_timing=True)
+                ended = torch.cuda.Event(enable_timing=True)
+                started.record()
+                output = model(x, mask)
+                ended.record()
+                torch.cuda.synchronize(device)
+                samples_ms.append(started.elapsed_time(ended))
+                del output
         peak_allocated = torch.cuda.max_memory_allocated(device)
         peak_reserved = torch.cuda.max_memory_reserved(device)
         total = payload["total_vram_bytes"]
@@ -97,7 +101,8 @@ def run(args: argparse.Namespace) -> dict:
                 <= int(total * args.target_vram_fraction)
                 else "OVER_TARGET"
             ),
-            latency_ms=started.elapsed_time(ended),
+            latency_ms=statistics.median(samples_ms),
+            latency_samples_ms=samples_ms,
             peak_allocated_bytes=peak_allocated,
             peak_reserved_bytes=peak_reserved,
         )
@@ -122,6 +127,7 @@ def main() -> int:
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="float32")
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--target-vram-fraction", type=float, default=0.85)
     parser.add_argument("--idle-timeout", type=int, default=900)
@@ -130,6 +136,8 @@ def main() -> int:
     args = parser.parse_args()
     if not 0.0 < args.target_vram_fraction < 1.0:
         parser.error("--target-vram-fraction must be between 0 and 1")
+    if args.warmup < 0 or args.repeats <= 0:
+        parser.error("--warmup must be non-negative and --repeats must be positive")
     try:
         payload = run(args)
     except (RuntimeError, ValueError) as exc:
