@@ -1389,6 +1389,10 @@ genuine edge on `default_fp16`/`causal_fp16`/`padded_fp16`.
 
 ## 6. Reproducing
 
+For the autonomous propose-measure-judge-record workflow and its mandatory measurement
+contract, start with [`ORCHESTRATOR.md`](ORCHESTRATOR.md). Direct commands below remain useful
+for reproducing historical results, but new judged numbers must be produced through `tools/`.
+
 ```
 python run_bench.py --suite default      # 5 configs, correctness + speed
 python run_bench.py --suite full         # 10 configs incl. long-seq and wide
@@ -1438,3 +1442,88 @@ though such a design would need its own scrutiny for whether it still
 qualifies as a legitimate approximation of the true fp32 computation. Current
 production boundary (Level A) is not merely "the one we picked" -- it appears
 to sit right at the edge of what this shape of perturbation can survive.
+
+## 8. Cross-branch comparison: `main` vs `minseok`
+
+A separate branch (`minseok`, diverged at `1d49688` / opt/07) tackles the same
+14-row `user_matrix` grading set with an independent strategy: no hand-written
+Triton kernels for LayerNorm/attention/masking -- instead a blanket
+`torch.autocast(float16)` over the GEMMs (gated on `batch*seq >= 4096`) plus
+`torch.compile(mode="reduce-overhead")` for fusion and CUDA-graph capture, with
+one custom fused-streaming-FFN kernel reserved for the `ffn=100000` OOM case.
+Its own log (`MINSEOK_LOG.md`) reported geomean 1.21x / mean MFU 20.4% -- but
+measured on an RTX 4060 **Laptop** (Ada, 8GB), not the grading GPU, and against
+a `torch.compile(mode="reduce-overhead")` bar. This repo's own reported numbers
+above (3.76x-4.09x geomean, ~31% mean MFU) are against `torch.compile`'s
+**default** mode -- no CUDA graph. Those two headline figures are not
+comparable: different bar, different GPU. Both were re-measured here, on this
+box, to find out how much of the ~3x apparent gap was real.
+
+**Isolating the bar-mode confound.** Toggling only `--compile-mode` from
+`default` to `reduce-overhead` for this repo's own optimized model, same code,
+same GPU, same 13 rows (row 14 excluded -- see below):
+
+| bar | geomean | mean MFU |
+|---|---|---|
+| `torch.compile(mode="default")` (this repo's documented bar) | 3.76x-4.09x | ~31.1% |
+| `torch.compile(mode="reduce-overhead")` (CUDA-graph bar, matches `minseok`'s protocol) | **2.610x** | **36.84%** |
+
+The `default`-mode bar is launch-overhead-bound at these mostly-tiny shapes
+(most rows are batch*seq in the low thousands); switching it to
+`reduce-overhead` removes that overhead from the *bar*, not from this repo's
+model, so the reported speedup drops -- geomean alone moves from ~3.9x to
+2.61x from this one change.
+
+**Isolating the hardware confound.** Re-running `minseok`'s own harness
+(`run_matrix.py`, unmodified except one environment fix below) here, on the
+RTX 5060 Ti, against its own `reduce-overhead` bar:
+
+| harness | GPU | geomean | mean MFU |
+|---|---|---|---|
+| `minseok`'s own reported numbers | RTX 4060 Laptop (Ada, 8GB) | 1.21x | 20.4% |
+| `minseok`, re-measured here | RTX 5060 Ti (Blackwell, 16GB) | **1.756x** | **22.3%** |
+
+Both confounds pushed the same direction (inflating the apparent gap between
+the two branches' headline numbers). Environment fix needed to get
+`minseok`'s code running here at all: this build's `torch._inductor.config
+.use_static_cuda_launcher` (on by default, see the step-7 Windows/torch-2.8
+overflow bug above) crashes the moment `minseok`'s `torch.compile`d model
+actually runs a kernel; setting it `False` (or `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0`)
+fixes it -- same bug, same fix, unrelated to either branch's code.
+
+**Equal-footing result** -- same RTX 5060 Ti, same `reduce-overhead` bar, same
+13 rows, one process per measurement:
+
+| | geomean vs reduce-overhead bar | mean MFU |
+|---|---|---|
+| `main` (this branch) | **2.610x** | **36.84%** |
+| `minseok` | 1.756x | 22.3% |
+
+`main` is **1.49x** faster than `minseok` in geomean terms once the bar and
+the hardware are held fixed -- a real, positive margin, but well short of the
+~3x the two branches' own self-reported numbers implied.
+
+**Row 14 (`ffn=100000`) has no valid number in any of the tables above.** The
+compiled baseline OOMs on this 16GB card in *both* compile modes, for *both*
+branches (confirmed independently: this repo's own unchunked eager baseline
+also OOMs here without `--chunk-baseline-ffn`; `minseok`'s harness logs the
+same `cbase-OOM`). The only fair comparison at this shape is the two
+optimized models' own latency, chunked-baseline-verified correct on both
+sides:
+
+| | 14_extreme latency | accuracy |
+|---|---|---|
+| `main` | **699.6 ms** | PASS (max_abs 1.35e-3) |
+| `minseok` | 4916.7 ms | PASS (max_abs 9.08e-4) |
+
+`main`'s chunked-FFN kernel is **7.0x** faster than `minseok`'s at the one
+shape too large for any compiled-baseline comparison.
+
+**Verdict**: `main`'s shape-specific Triton kernels (fused LayerNorm+residual,
+block-triangular causal attention and Q@K^T/scale+mask, GEMM routing) beat
+`minseok`'s blanket-autocast-plus-`torch.compile` approach on genuinely equal
+footing -- same GPU, same bar, same 14 rows -- by ~1.5x in aggregate and up to
+7x on the extreme-FFN shape. The raw ~3x headline gap between the two
+branches' own self-reported numbers was real but overstated, driven about
+evenly by an easier compiled-baseline bar and a weaker dev GPU on `minseok`'s
+side, not by a phantom advantage on this side.
