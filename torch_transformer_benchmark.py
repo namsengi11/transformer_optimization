@@ -82,7 +82,11 @@ class TransformerConfig:
 # the observed safe admission boundary is 65% of installed VRAM. Never use
 # current free memory: the selected arithmetic must not depend on neighbours.
 _STREAMING_MEMORY_BUDGET_FRAC = 0.65
-_STREAMING_QUERY_MEMORY_BUDGET_FRAC = 0.20
+# Row 14 with a 20% query budget selected Q=256 and left insufficient
+# cuBLAS workspace for probs@V after causal key trimming. A 10% budget selects
+# Q=128 on this card and reserves the other 90% for the resident stream,
+# Q/K/V/context tensors, allocator fragmentation, and GEMM workspaces.
+_STREAMING_QUERY_MEMORY_BUDGET_FRAC = 0.10
 
 
 def _capacity_terms_bytes(

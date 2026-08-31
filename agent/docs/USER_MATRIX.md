@@ -52,6 +52,12 @@ one shard at a time. Streaming timing includes transfers and uses explicit long-
 ratio for a streamed row until an equivalent compiled streaming bar exists; report its
 optimized latency and MFU separately and exclude it from compiled-bar geomeans.
 
+The query-tiled reference reserves at most 10% of installed VRAM for its simultaneously
+live score/probability tile. A 20% calibration attempt selected 256 query rows for row 14
+but left insufficient `probs @ V` workspace; 10% selects 128 and leaves the remaining
+capacity for the resident shard, Q/K/V/context tensors, allocator fragmentation, and GEMM
+workspaces.
+
 ## Schema correction
 
 Before 2026-08-31, `run_bench.py` incorrectly interpreted the unlabeled values as
