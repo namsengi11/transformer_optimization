@@ -240,7 +240,7 @@ def run_case(name: str, extra: list[str], compile_baseline: bool,
 
     env = dict(os.environ)
     env.setdefault("PYTHONWARNINGS", "ignore")
-    # Surfaces the fp32 fp16-GEMM calibration gate's decision on stderr, so
+    # Surfaces the fp32 fp16-GEMM policy on stderr, so
     # MFU can be computed against the PRECISION ACTUALLY EXECUTED (fp16
     # tensor cores if the gate enabled it) rather than the model's declared
     # dtype -- without this, an fp32 case running the fp16-GEMM path gets
@@ -359,7 +359,7 @@ def main() -> int:
         opt_ms = acc_run.get("optimized_ms")
         shape = resolve_shape(extra)
         # MFU must reflect the precision ACTUALLY EXECUTED. The fp32
-        # fp16-GEMM calibration gate can silently switch an fp32 case onto
+        # fp16-GEMM policy can switch an fp32 case onto
         # fp16 tensor cores; the compiled baseline never takes that path
         # (it's plain BaselineTransformer, always TF32 for fp32 dtype).
         opt_shape = dict(shape)
@@ -391,19 +391,20 @@ def main() -> int:
         if acc_run.get("log"):
             print(acc_run["log"], flush=True)
 
-    print(chr(10) + "=" * 92)
+    print(chr(10) + "=" * 108)
     print(f"SUITE={args.suite}  TAG={tag}")
-    print("correctness vs EAGER baseline | speed + MFU vs COMPILED baseline")
-    print("=" * 92)
-    hdr = (f"{'case':<18} {'acc':<5} {'opt_ms':>9} {'compiled_ms':>12} "
-           f"{'vs_compiled':>12} {'mfu_opt':>9} {'mfu_bar':>9}")
+    print("correctness vs NAIVE baseline | speed + MFU vs COMPILED baseline")
+    print("=" * 108)
+    hdr = (f"{'case':<18} {'acc':<5} {'naive_ms':>10} {'compiled_ms':>12} "
+           f"{'ours_ms':>10} {'vs_compiled':>12} {'mfu_ours':>9} {'mfu_bar':>9}")
     print(hdr)
     print("-" * len(hdr))
     nan = float("nan")
     for r in results:
         print(f"{r['name']:<18} {str(r['accuracy']):<5} "
-              f"{r['optimized_ms'] or nan:>9.4f} "
+              f"{r['eager_baseline_ms'] or nan:>10.4f} "
               f"{r['compiled_baseline_ms'] or nan:>12.4f} "
+              f"{r['optimized_ms'] or nan:>10.4f} "
               f"{r['speedup_vs_compiled'] or nan:>11.3f}x "
               f"{100*(r['mfu_optimized'] or nan):>8.2f}% "
               f"{100*(r['mfu_compiled_baseline'] or nan):>8.2f}%")
@@ -437,7 +438,7 @@ def main() -> int:
     path = outdir / f"{tag.replace('/', '_')}_{args.suite}.json"
     path.write_text(json.dumps(results, indent=2))
     print(f"{chr(10)}wrote {path}")
-    return 0
+    return 0 if n_pass == len(executed) else 2
 
 
 if __name__ == "__main__":
