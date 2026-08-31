@@ -40,7 +40,7 @@ def disable_static_cuda_launcher() -> None:
 def _git(*args: str) -> str:
     try:
         out = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True,
-                             text=True, timeout=30)
+                             text=True, errors="replace", timeout=30)
         return out.stdout.strip()
     except Exception:
         return ""
@@ -93,7 +93,7 @@ def _nvidia_smi(query: str, extra: Sequence[str] = ()) -> list[list[str]]:
     try:
         out = subprocess.run(
             ["nvidia-smi", f"--query-{query}", "--format=csv,noheader,nounits", *extra],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, errors="replace", timeout=20)
     except Exception:
         return []
     if out.returncode != 0:
@@ -152,7 +152,7 @@ def process_sm_utilization() -> dict[int, int]:
     try:
         out = subprocess.run(
             ["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, errors="replace", timeout=10)
     except Exception:
         return {}
     if out.returncode != 0:
@@ -180,7 +180,7 @@ def _descendants(root: int) -> set[int]:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
              "Get-CimInstance Win32_Process | "
              "Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, errors="replace", timeout=30)
         data = json.loads(ps.stdout or "[]")
     except Exception:
         return {root}
@@ -200,6 +200,18 @@ def _descendants(root: int) -> set[int]:
                 seen.add(kid)
                 stack.append(kid)
     return seen
+
+
+def sample_process_sm_with_own(root: int) -> tuple[dict[int, int], set[int]]:
+    """Bracket a blocking SM sample with own-process snapshots.
+
+    A benchmark child may finish while ``nvidia-smi pmon`` is sampling, so a
+    descendant lookup only afterward can mislabel the exited child as foreign.
+    """
+    own_before = _descendants(root)
+    current_sm = process_sm_utilization()
+    own_after = _descendants(root)
+    return current_sm, own_before | own_after
 
 
 def wait_for_idle(util_threshold: int = 10, hold_s: float = 5.0,
@@ -261,8 +273,7 @@ class ForeignLoadSampler:
             # Benchmark children are launched after this sampler is created.
             # Recompute the process tree on every sample so those children are
             # never mislabeled as foreign GPU users.
-            current_sm = process_sm_utilization()
-            own = _descendants(os.getpid())
+            current_sm, own = sample_process_sm_with_own(os.getpid())
             for pid, sm in current_sm.items():
                 if pid in own:
                     continue
@@ -276,8 +287,7 @@ class ForeignLoadSampler:
 
     def __enter__(self) -> "ForeignLoadSampler":
         self.baseline_foreign_pids = compute_pids() - _descendants(os.getpid())
-        baseline_sm = process_sm_utilization()
-        own = _descendants(os.getpid())
+        baseline_sm, own = sample_process_sm_with_own(os.getpid())
         self.baseline_foreign_sm = {pid: sm for pid, sm in baseline_sm.items() if pid not in own}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -310,7 +320,7 @@ def ranges_overlap(a: Sequence[float], b: Sequence[float]) -> bool:
 
     The promotion rule requires NON-overlapping ranges across repeated runs
     before a latency delta counts. Overlapping ranges are noise, whatever the
-    medians say -- `07_seq32`-class shapes swing 25% between identical runs.
+    medians say -- historical tiny-shape runs swung 25% between identical runs.
     """
     if not a or not b:
         return True

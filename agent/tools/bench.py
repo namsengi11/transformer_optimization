@@ -35,7 +35,8 @@ def _run_case(suite: str, case: str, tag: str, timeout: int,
            "--tag", tag, "--timeout", str(timeout), "--bar-reps", str(bar_reps)]
     with ForeignLoadSampler() as sampler:
         proc = subprocess.run(cmd, cwd=AGENT_ROOT, env=env, capture_output=True,
-                              text=True, timeout=timeout * max(2, bar_reps + 1))
+                              text=True, errors="replace",
+                              timeout=timeout * max(2, bar_reps + 1))
     if proc.returncode != 0:
         tail = (proc.stdout + proc.stderr)[-5000:]
         raise RuntimeError(f"run_bench failed for {case} (exit {proc.returncode}):\n{tail}")
@@ -85,9 +86,15 @@ def run_suite(suite: str, tag: str, runs: int, timeout: int, bar_reps: int,
             for metric in METRICS
             if any(row.get(metric) is not None for row in raw_runs)
         }
+        statuses = {row.get("status", "EXECUTED") for row in raw_runs}
+        preflight_blocked = statuses == {"PREFLIGHT_BLOCKED"}
         case_payload: dict[str, Any] = {
             "name": case,
-            "accuracy_pass": all(row.get("accuracy") == "PASS" for row in raw_runs),
+            "status": "PREFLIGHT_BLOCKED" if preflight_blocked else "EXECUTED",
+            "accuracy_pass": (
+                None if preflight_blocked
+                else all(row.get("accuracy") == "PASS" for row in raw_runs)
+            ),
             "trusted": all(load.get("trusted") for load in loads),
             "summaries": summaries,
             "runs": raw_runs,
@@ -112,9 +119,11 @@ def run_suite(suite: str, tag: str, runs: int, timeout: int, bar_reps: int,
                 }
         output_cases.append(case_payload)
 
-    valid_speedups = [case["summaries"]["speedup_vs_compiled"]["median"] for case in output_cases
+    executed_cases = [case for case in output_cases if case["status"] == "EXECUTED"]
+    blocked_cases = [case for case in output_cases if case["status"] == "PREFLIGHT_BLOCKED"]
+    valid_speedups = [case["summaries"]["speedup_vs_compiled"]["median"] for case in executed_cases
                       if "speedup_vs_compiled" in case["summaries"]]
-    valid_mfu = [case["summaries"]["mfu_optimized"]["median"] for case in output_cases
+    valid_mfu = [case["summaries"]["mfu_optimized"]["median"] for case in executed_cases
                  if "mfu_optimized" in case["summaries"]]
     comparisons = [case.get("comparison", {}).get("verdict") for case in output_cases
                    if case.get("comparison")]
@@ -127,14 +136,20 @@ def run_suite(suite: str, tag: str, runs: int, timeout: int, bar_reps: int,
         "aggregate": {
             "geomean_speedup_vs_compiled": geomean(valid_speedups),
             "average_mfu_optimized": (sum(valid_mfu) / len(valid_mfu)) if valid_mfu else None,
-            "accuracy": f"{sum(c['accuracy_pass'] for c in output_cases)}/{len(output_cases)} PASS",
+            "accuracy": (
+                f"{sum(c['accuracy_pass'] is True for c in executed_cases)}/"
+                f"{len(executed_cases)} PASS"
+            ),
+            "preflight_blocked": f"{len(blocked_cases)}/{len(output_cases)}",
             "comparison_verdict": (
                 "regressed" if "regressed" in comparisons else
                 "improved" if "improved" in comparisons else
                 "noise" if comparisons else None
             ),
         },
-        "trusted": all(case["trusted"] and case["accuracy_pass"] for case in output_cases),
+        "trusted": all(case["trusted"] for case in output_cases) and all(
+            case["accuracy_pass"] is True for case in executed_cases
+        ),
     }
 
 
@@ -145,11 +160,13 @@ def _human(payload: dict[str, Any]) -> None:
         s = case.get("summaries", {}).get("optimized_ms", {})
         timing = f"{s.get('min', float('nan')):.4f}/{s.get('median', float('nan')):.4f}/{s.get('max', float('nan')):.4f}"
         verdict = case.get("comparison", {}).get("verdict", "-")
-        print(f"{case['name']:<20} {str(case['accuracy_pass']):<5} {str(case['trusted']):<8} {timing:<30} {verdict}")
+        accuracy = "BLOCK" if case.get("status") == "PREFLIGHT_BLOCKED" else str(case["accuracy_pass"])
+        print(f"{case['name']:<20} {accuracy:<5} {str(case['trusted']):<8} {timing:<30} {verdict}")
     agg = payload["aggregate"]
     print(f"geomean vs compiled: {agg['geomean_speedup_vs_compiled']}")
     print(f"average MFU: {agg['average_mfu_optimized']}")
     print(f"accuracy: {agg['accuracy']} | trusted={payload['trusted']}")
+    print(f"preflight blocked: {agg['preflight_blocked']}")
 
 
 def main() -> int:

@@ -27,11 +27,26 @@ it. Scoring `add_ln` against DRAM produced the retracted 2022 GB/s and “78% of
 
 **Lesson:** A small median delta is not evidence when run ranges overlap.
 
-**Evidence:** `07_seq32` varied from roughly 0.064 to 0.327 ms under sync-per-call timing, and
-autotuning selected four different short-attention configurations across runs.
+**Evidence:** The historical, misdecoded case named `07_seq32` varied from roughly 0.064 to
+0.327 ms under sync-per-call timing, and autotuning selected four different short-attention
+configurations across runs. That case combined `seq_len=32` with `d_model=32`; it is not the
+corrected official row 7 and cannot establish a per-case baseline for `07_dmodel32`.
 
 **How to apply:** Use at least three independent `agent/tools/bench.py` runs. Promote latency only
 when min/max ranges do not overlap; otherwise record `noise`.
+
+## Benchmark schemas must be explicit
+
+**Lesson:** Never infer a positional benchmark schema from values that happen to produce
+constructible models.
+
+**Evidence:** The user matrix was decoded in the wrong column order, changing rows 7, 8, 12,
+13, and 14 while leaving enough rows valid to hide the mistake. Historical full-matrix
+latency and MFU aggregates therefore described a different workload.
+
+**How to apply:** Use the named columns and canonical table in `agent/docs/USER_MATRIX.md`.
+Keep case names aligned with their varied axis, validate all 14 resolved shapes before a
+run, and never compare an old retired-name artifact with a corrected-matrix artifact.
 
 ## Fixed-checkout A/B prevents moving-main comparisons
 

@@ -189,9 +189,10 @@ class BaselineTransformer(nn.Module):
 class ChunkedBaselineTransformerBlock(BaselineTransformerBlock):
     """BaselineTransformerBlock with the FFN sub-step computed in row-chunks
     along the flattened (batch*seq) dimension, to bound peak memory for very
-    large ffn_dim configs (e.g. ffn_dim=100000 materializes a
-    [batch, seq, ffn_dim] GELU intermediate that does not fit in 16GB at
-    batch=32/seq=1024 in one shot).
+    large ``batch*seq*ffn_dim`` intermediates. Canonical matrix row 14
+    (batch=32, seq=100000, ffn_dim=1024) would materialize a 12.2 GiB GELU
+    intermediate in one shot, although its much larger dense-attention score
+    tensor causes the benchmark driver to preflight-block that row first.
 
     In exact (real-number) arithmetic this changes nothing: LayerNorm/GELU/
     the two FFN Linears are all strictly row-wise (no cross-token mixing,
@@ -204,7 +205,7 @@ class ChunkedBaselineTransformerBlock(BaselineTransformerBlock):
     _fused_attn_probs's docstring on the dtype=torch.float32 divergence at
     long sequences). Measured directly: at d_model=512/ffn_dim=2048, chunk
     sizes 256/512 are bit-exact but 64/128 are not (max_abs ~6e-4); at
-    d_model=1024/ffn_dim=100000 (this class's actual motivating shape),
+    d_model=1024/ffn_dim=100000 (the pre-2026-08-31 misdecoded row-14 shape),
     128 through 4096 are all bit-exact but 64 is not (max_abs ~2.6e-4).
     The relationship is NOT a simple "big enough is safe" threshold -- a
     d_model=1024/ffn_dim=8192 sweep found 128 exact, then 256/512/1024/
@@ -213,7 +214,9 @@ class ChunkedBaselineTransformerBlock(BaselineTransformerBlock):
     proven-safe-in-general one: verify bit-exactness against
     BaselineTransformer at a feasible reduced-size shape (same d_model and
     ffn_dim, smaller batch/seq) before trusting a new (d_model, ffn_dim,
-    chunk_size) combination, the same way this one was checked.
+    chunk_size) combination, the same way this one was checked. In
+    particular, that legacy measurement is not correctness evidence for the
+    canonical row-14 ffn_dim=1024 shape.
 
     Reuses norm1/attention/norm2/ffn_in/ffn_out from BaselineTransformerBlock
     unchanged (no new parameters), so state_dict() keys and copy_model_weights
@@ -694,9 +697,9 @@ def _triton_fused_scale_mask(
 # Those two steps tried to beat cuBLAS at GEMM and ATen/inductor at a strided
 # copy on the *default* shape (d_model=512, ffn_dim=2048), where the workload
 # is 85% GEMM and therefore compute-bound. The graded configurations are a
-# completely different regime. Every one of them except the two "extreme"
-# rows has d_model in {32, 128} and ffn_dim in {32, 128, 1024}, which makes
-# the arithmetic intensity collapse: at (batch=64, seq=128, d_model=128,
+# completely different regime. Rows 1-13 use d_model and ffn_dim in
+# {32, 128, 1024}, with most rows at 128; row 14 uses the same width set but
+# an infeasible seq_len=100000. At (batch=64, seq=128, d_model=128,
 # ffn=128, layers=4) the dense matmul cost is ~0.35 ms of a ~0.9 ms forward,
 # and MEASURED profiles put LayerNorm alone at 35-42% of total GPU time
 # (per-shape numbers in OPTIMIZATION_LOG.md step 11). ATen's layer_norm
@@ -967,7 +970,8 @@ def _triton_add_layernorm(
 # ---------------------------------------------------------------------------
 #
 # The second place the graded shapes buy something the general-purpose kernel
-# cannot use. seq_len is 32 or 128 in 12 of the 14 graded configurations, so
+# cannot use. seq_len is 128 in rows 1-12 except row 12 (seq_len=32), so 12
+# of the 14 graded configurations have seq_len 32 or 128. Therefore
 # the ENTIRE [S, S] score matrix for one (batch, head) pair fits in a single
 # Triton program's registers. That removes the reason flash / memory-efficient
 # attention exists: there is no need to tile the key axis, and therefore no
@@ -1095,7 +1099,9 @@ if _TRITON_AVAILABLE:
         at -inf and repairing the resulting NaN afterwards) additionally
         lets the post-exp `tl.where` be dropped -- that select also ran over
         every score element. Together: 1.50x at head_dim=8, 1.29x at
-        head_dim=32, 2.24x at the seq_len=32 shape.
+        head_dim=32, 2.24x at the historical S=32/D=32/H=4 probe. That probe
+        predates the matrix schema correction and is not a timing for the
+        canonical `12_seq32` shape (S=32/D=128/H=4).
 
         BLOCK_D is padded up to at least 16 because tl.dot requires it; the
         padding lanes are loaded as zero and never stored, so head_dim=8
@@ -1246,23 +1252,22 @@ def _triton_short_attention(
 #
 # The bar here is different, and much lower: not "beat cuBLAS at the GEMM"
 # but "beat cuBLAS's GEMM *plus a separate ATen GELU pass*". Fusing deletes a
-# full write-then-read of the [batch*seq, ffn_dim] hidden tensor, which at
-# 13_ffn1024 is a 32 MB round trip -- right at this card's 32 MiB L2
-# capacity, so it is real DRAM traffic. cuBLAS runs that GEMM in 79.2 us and
-# ATen's GELU costs another 43.7, so a fused kernel only has to reach ~65% of
-# cuBLAS's throughput to come out ahead.
+# full write-then-read of the [batch*seq, ffn_dim] hidden tensor. The timing
+# evidence below predates the 2026-08-31 matrix schema correction: its shape
+# tuples remain useful kernel evidence, but the retired row labels do not
+# describe canonical benchmark cases and must not be used as suite results.
 #
 # Measured (CUDA-graph timed, fp16, vs `F.linear` + `F.gelu`):
 #
-#   shape (M x K x N)              cuBLAS+GELU   fused    ratio   bit-exact
-#   13_ffn1024   8192 x 128 x 1024     113.92    63.14   1.80x      yes
-#   07_seq32     2048 x  32 x  128       4.00     2.59   1.54x      yes
-#   05_batch128 16384 x 128 x  128      26.75    18.02   1.48x      yes
-#   01_base      8192 x 128 x  128      14.45    10.02   1.44x      yes
-#   08_seq1024  65536 x1024 x  128     437.42   386.37   1.13x      no
-#   default     1024 x 512 x 2048       56.67    52.23   1.09x      no
-#   12_ffn32     8192 x 128 x   32       5.25     6.05   0.87x      yes
-#   02_batch1     128 x 128 x  128       2.33     2.85   0.82x      yes
+#   historical shape (M x K x N)       cuBLAS+GELU   fused   ratio  bit-exact
+#   legacy row 13   8192 x 128 x 1024       113.92    63.14   1.80x    yes
+#   legacy row 07   2048 x  32 x  128         4.00     2.59   1.54x    yes
+#   row 05         16384 x 128 x  128        26.75    18.02   1.48x    yes
+#   row 01          8192 x 128 x  128        14.45    10.02   1.44x    yes
+#   legacy row 08  65536 x1024 x  128       437.42   386.37   1.13x     no
+#   default         1024 x 512 x 2048        56.67    52.23   1.09x     no
+#   legacy row 12   8192 x 128 x   32         5.25     6.05   0.87x    yes
+#   row 02           128 x 128 x  128         2.33     2.85   0.82x    yes
 #
 # BIT-EXACT at six of eight shapes -- `torch.equal`, not "close". Two things
 # make that possible and both are deliberate:
@@ -1371,7 +1376,8 @@ def _fused_ffn_supported(rows: int, ffn_dim: int) -> bool:
 # sitting on the short-reduction ceiling -- but that sweep only ever compared
 # cuBLAS against cuBLAS. It established the shape of the ceiling correctly and
 # then *assumed* cuBLAS reached it. It does not: at the narrow-N projections
-# these shapes produce (N = d_model or 3*d_model, with d_model 32 or 128)
+# the narrow-width subset produces (N = d_model or 3*d_model, with d_model
+# 32 or 128)
 # cuBLAS dispatches to a wmma kernel and a plain Triton GEMM beats it
 # outright.
 #
@@ -1604,6 +1610,23 @@ class _GraphCacheEntry:
         self.static_output = static_output
 
 
+# A captured CUDA graph keeps every allocation in its private pool alive for
+# the lifetime of the model. Unlike ordinary eager allocations, that memory
+# cannot be returned between layers or after warmup. Keep graph mechanisms
+# below a deliberately conservative fraction of total VRAM, calculated from
+# shape and device properties only. In particular, never use mem_get_info():
+# it synchronizes and would make the selected arithmetic depend on unrelated
+# processes sharing the card.
+_GRAPH_MEMORY_BUDGET_FRAC = 0.20
+# Inductor's whole-core schedule can avoid the fp32 score/probability
+# materialization used by the hand-rolled eager graph on the fp32 SDPA path.
+# It is therefore safe to admit a larger (but still capacity-bounded) working
+# set to that candidate. This is deliberately a separate policy: treating an
+# Inductor graph as though it retained the eager graph's pool was needlessly
+# excluding row 6, the capacity-sensitive user shape this experiment targets.
+_FUSED_GRAPH_MEMORY_BUDGET_FRAC = 0.55
+
+
 class UserOptimizedTransformer(BaselineTransformer):
     """
     Eager-mode optimized implementation of BaselineTransformer.
@@ -1827,6 +1850,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         # One shared CUDA graph memory pool for every graph this model
         # captures, to limit allocator fragmentation across distinct keys.
         self._graph_pool = None
+        # Step 20: a per-dispatch-key torch.compile'd whole-core candidate
+        # plus its margin-gated verdict. These are plain attributes so the
+        # model remains strict-state-dict compatible. A small candidate uses
+        # an Inductor cudagraph tree; a capacity-sensitive one uses Inductor
+        # fusion without a retained CUDA graph. Neither is ever nested in the
+        # hand-rolled CUDA graph above.
+        self._fused_graph_gate: Dict[Tuple, bool] = {}
+        self._fused_graph_cores: Dict[Tuple, object] = {}
+        self._fused_graph_disabled: bool = False
         # (mask.data_ptr(), mask.shape, mask.dtype, mask._version) -> whether
         # the mask is all-True. Memoized so that repeated forward() calls
         # with the *same* mask tensor object (e.g. the fixed input reused
@@ -1953,7 +1985,238 @@ class UserOptimizedTransformer(BaselineTransformer):
             # wraps the whole model in torch.compile); graph capture must
             # never run underneath that trace.
             return False
-        return True
+        return self._graph_memory_safe(x)
+
+    def _graph_memory_safe(self, x: torch.Tensor) -> bool:
+        """Whether either CUDA-graph implementation may retain this shape.
+
+        CUDA graphs trade allocation reuse for a private, persistent pool.
+        A shape whose eager peak fits can therefore still OOM at capture when
+        the pool coexists with the eager baseline and the second model. This
+        deliberately conservative static estimate declines those shapes
+        before allocating anything. It is a pure function of the shape,
+        configuration, dtype, and installed card, so it is safe before graph
+        capture and stable across otherwise-idle benchmark runs.
+        """
+        if x.device.type != "cuda":
+            return False
+        batch, seq_len, d_model = x.shape
+        if self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim, x.device) is not None:
+            # Chunking exists specifically for capacity-bound FFNs. Capturing
+            # its temporary chunks would turn that bounded peak into retained
+            # graph-pool memory, defeating the mechanism.
+            return False
+        try:
+            total_bytes = torch.cuda.get_device_properties(x.device).total_memory
+        except Exception:
+            # A failed property query must never turn an unknown-capacity card
+            # into a graph-capture experiment.
+            return False
+
+        element_bytes = x.element_size()
+        rows = batch * seq_len
+        input_bytes = rows * d_model * element_bytes
+        # The core can have the residual stream, normalized activations,
+        # QKV/context temporaries, and FFN intermediates live around a layer
+        # boundary. The multipliers intentionally overstate the liveness:
+        # decline is cheap, an OOM poisons a benchmark process.
+        score_bytes = batch * self.config.num_heads * seq_len * seq_len * element_bytes
+        hidden_bytes = rows * self.config.ffn_dim * element_bytes
+        estimated_pool_bytes = 10 * input_bytes + 3 * score_bytes + 4 * hidden_bytes
+        return estimated_pool_bytes <= int(total_bytes * _GRAPH_MEMORY_BUDGET_FRAC)
+
+    def _fused_graph_memory_safe(self, x: torch.Tensor, use_sdpa: bool) -> bool:
+        """Capacity gate for the Inductor whole-core candidate.
+
+        This is intentionally distinct from `_graph_memory_safe`: the latter
+        describes the retained allocations of the eager, hand-rolled graph.
+        On the fp32 SDPA path, Inductor retains neither the eager score nor
+        probability tensor, so charging it for those tensors would reject
+        the row-6 candidate before it can demonstrate that lower footprint.
+        The estimate still reserves a large fixed margin for both models,
+        outputs retained by the accuracy probe, CUDA workspaces, and the
+        runtime outside the compiled graph.
+        """
+        if x.device.type != "cuda":
+            return False
+        batch, seq_len, d_model = x.shape
+        if self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim, x.device) is not None:
+            return False
+        try:
+            total_bytes = torch.cuda.get_device_properties(x.device).total_memory
+        except Exception:
+            return False
+
+        element_bytes = x.element_size()
+        rows = batch * seq_len
+        input_bytes = rows * d_model * element_bytes
+        hidden_bytes = rows * self.config.ffn_dim * element_bytes
+        score_bytes = 0 if use_sdpa else (
+            batch * self.config.num_heads * seq_len * seq_len * element_bytes
+        )
+        estimated_pool_bytes = 6 * input_bytes + 4 * hidden_bytes + 3 * score_bytes
+        return estimated_pool_bytes <= int(total_bytes * _FUSED_GRAPH_MEMORY_BUDGET_FRAC)
+
+    @staticmethod
+    def _fused_graph_requested() -> bool:
+        """Experimental A/B arm; disabled unless the caller explicitly asks."""
+        return os.environ.get("TJ_FUSED_GRAPH", "0") not in ("", "0", "false", "False")
+
+    def _probe_fused_graph(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+        use_tri_qk: bool,
+        use_tri_linear: bool,
+        key: Tuple,
+    ) -> bool:
+        """Compile and admit the whole-core Inductor candidate once per key.
+
+        The eager `_forward_core` reference has the exact arithmetic of the
+        existing hand-rolled graph, without allocating that graph's retained
+        pool. The candidate is compiled and invoked here, before timing and
+        under the caller's actual dispatch mode; later forwards only call the
+        already-warmed callable. It is never wrapped in `torch.cuda.graph`,
+        avoiding the double-pool OOM mode. For a shape the hand-rolled graph
+        rejected on capacity grounds, keep Inductor fusion but explicitly
+        disable its cudagraph tree too: the harness needs five eager-reference
+        trials, and retaining that private pool starves trial two on row 6.
+        """
+        if self._fused_graph_disabled or not self._fused_graph_memory_safe(x, use_sdpa):
+            return False
+        try:
+            with torch.inference_mode():
+                reference = self._forward_core(
+                    x, valid_token_mask, mask_active, causal, use_sdpa,
+                    use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                    use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear,
+                )
+
+            compiled = self._fused_graph_cores.get(key)
+            if compiled is None:
+                def core(core_x: torch.Tensor, core_mask: Optional[torch.Tensor]):
+                    return self._forward_core(
+                        core_x, core_mask, mask_active, causal, use_sdpa,
+                        use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                        use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear,
+                    )
+
+                # `reduce-overhead` admits both Inductor fusion and its own
+                # CUDA graph for shapes whose retained eager pool is safe.
+                # On capacity-sensitive shapes, preserve fusion but opt out
+                # of Inductor's retained graph pool; this is still a compiled
+                # graph, just one replayed by normal launches. Keep the
+                # Windows static-launcher workaround around construction and
+                # first execution, when Dynamo specializes for this caller's
+                # dispatch key set.
+                with _no_static_cuda_launcher():
+                    if self._graph_memory_safe(x):
+                        compiled = torch.compile(core, mode="reduce-overhead")
+                    else:
+                        compiled = torch.compile(
+                            core,
+                            # Avoid static-shape buffer retention for the
+                            # large row-6 activation. The callable is still
+                            # cached on this exact configuration; `dynamic`
+                            # asks Inductor not to turn its intermediates into
+                            # a second model-lifetime arena.
+                            dynamic=True,
+                            options={
+                                "triton.cudagraphs": False,
+                                # Inductor's default intermediate pool keeps
+                                # row 6's multi-GiB work buffers live between
+                                # calls. The harness keeps the prior eager
+                                # reference/output live until the next trial,
+                                # so that pool leaves the baseline unable to
+                                # form its next score tensor. Let normal CUDA
+                                # allocation reuse handle this large shape.
+                                "memory_pool": "none",
+                            },
+                        )
+                    candidate = compiled(x, valid_token_mask)
+                self._fused_graph_cores[key] = compiled
+            else:
+                with _no_static_cuda_launcher():
+                    candidate = compiled(x, valid_token_mask)
+
+            atol, rtol = _fp16_gemm_gate_thresholds()
+            abs_err = (candidate.float() - reference.float()).abs()
+            rel_err = abs_err / reference.float().abs().clamp_min(1e-12)
+            ok = ((abs_err <= _FP16_GEMM_GATE_MARGIN * atol)
+                  | (rel_err <= _FP16_GEMM_GATE_MARGIN * rtol))
+            passed = bool(torch.all(ok).item())
+            detail = (f"failed={int((~ok).sum().item())}/{ok.numel()} "
+                      f"max_abs={abs_err.max().item():.6g}")
+        except Exception:
+            self._fused_graph_disabled = True
+            self._fused_graph_cores.pop(key, None)
+            # A failed compile/capture can leave releasable compiler scratch
+            # in the caching allocator. This is outside every captured region.
+            if x.device.type == "cuda":
+                torch.cuda.empty_cache()
+            return False
+
+        if os.environ.get("TJ_DEBUG_GATE"):
+            print(
+                f"[fused-graph-gate] shape={tuple(x.shape)} dtype={x.dtype} "
+                f"causal={causal} mask_active={mask_active} "
+                f"margin={_FP16_GEMM_GATE_MARGIN} {detail} -> "
+                f"{'ENABLE' if passed else 'DISABLE (hand-rolled graph/eager)'} "
+                f"inductor-fused graph",
+                file=sys.stderr,
+            )
+        if not passed:
+            # Do not retain Inductor's graph pool after a declined candidate
+            # and then build the hand-rolled fallback alongside it.
+            self._fused_graph_cores.pop(key, None)
+            if x.device.type == "cuda":
+                torch.cuda.empty_cache()
+        return passed
+
+    def _resolve_fused_graph_enabled(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        mask_active: bool,
+        causal: bool,
+        use_sdpa: bool,
+        use_fp16_gemm: bool,
+        use_fused_qkv: bool,
+        layout,
+        use_fused_ln: bool,
+        use_short_attn: bool,
+        use_fused_ffn: bool,
+        use_tri_qk: bool,
+        use_tri_linear: bool,
+        mask_kind: str,
+    ) -> Tuple[bool, Tuple]:
+        """Return the opt-in fused-core verdict and its full cache key."""
+        key = (
+            tuple(x.shape), x.dtype, x.device, causal, mask_kind,
+            use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln,
+            use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear,
+            torch.is_inference_mode_enabled(), torch.is_grad_enabled(),
+        )
+        if not self._fused_graph_requested() or x.device.type != "cuda":
+            return False, key
+        cached = self._fused_graph_gate.get(key)
+        if cached is None:
+            cached = self._probe_fused_graph(
+                x, valid_token_mask, mask_active, causal, use_sdpa,
+                use_fp16_gemm, use_fused_qkv, layout, use_fused_ln,
+                use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear, key,
+            )
+            self._fused_graph_gate[key] = cached
+        return cached, key
 
     def _calibrate_fp16_gemm(
         self,
@@ -2270,7 +2533,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         if self._fused_ffn_disabled or x.device.type != "cuda":
             return False
         batch, seq_len, _ = x.shape
-        if self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim) is not None:
+        if self._ffn_chunk_size(
+                batch, seq_len, self.config.ffn_dim, x.device) is not None:
             # The chunked path exists to bound peak memory at extreme
             # ffn_dim; materializing one fused [rows, ffn_dim] output would
             # defeat it.
@@ -2845,10 +3109,28 @@ class UserOptimizedTransformer(BaselineTransformer):
             use_fused_ffn, mask_kind,
         )
 
+        # The whole-core Inductor candidate is an explicit experiment arm.
+        # Its probe compiles and executes it before timing; a successful arm
+        # must never be wrapped in this model's hand-rolled CUDA graph because
+        # that would retain two independent graph pools for one shape.
+        use_fused_graph, fused_graph_key = self._resolve_fused_graph_enabled(
+            x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm,
+            use_fused_qkv, layout, use_fused_ln, use_short_attn,
+            use_fused_ffn, use_tri_qk, use_tri_linear, mask_kind,
+        )
+        if use_fused_graph:
+            compiled = self._fused_graph_cores.get(fused_graph_key)
+            assert compiled is not None, "fused graph was admitted without warmup"
+            with _no_static_cuda_launcher():
+                # Inductor cudagraph trees may reuse output storage, so retain
+                # the public forward contract of _replay_graph and return an
+                # independent result to the caller.
+                return compiled(x, valid_token_mask).clone()
+
         if not self._graph_capture_allowed(x):
             return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
 
-        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
+        key = (tuple(x.shape), x.dtype, x.device, causal, mask_kind, use_fp16_gemm, use_fused_qkv, layout is not None, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear, use_fused_graph)
 
         if key in self._graph_unsupported:
             return self._forward_core(x, valid_token_mask, mask_active, causal, use_sdpa, use_fp16_gemm, use_fused_qkv, layout, use_fused_ln, use_short_attn, use_fused_ffn, use_tri_qk, use_tri_linear)
@@ -3055,24 +3337,85 @@ class UserOptimizedTransformer(BaselineTransformer):
     # Row-count threshold (estimated fp32 GELU-intermediate bytes) above which
     # _forward_core switches to a row-chunked FFN instead of materializing
     # [batch*seq_len, ffn_dim] in one shot. 3GB is comfortably above every
-    # shape in this codebase's own test suites (largest: wide_fp16 at
-    # 4096*4096*4 = 67MB) so it never triggers for anything already
-    # validated -- only for configs like ffn_dim=100000 at batch=32/seq=1024
-    # (12.2GB unchunked) that would OOM a 16GB GPU otherwise. See
+    # executable shape in this codebase's own test suites (largest:
+    # wide_fp16 at 4096*4096*4 = 67MB) so it never triggers for rows 1-13.
+    # Canonical row 14 has batch=32/seq=100000/ffn_dim=1024 and the same
+    # 12.2 GiB FFN-intermediate footprint as the old misdecoded row, but it is
+    # preflight-blocked earlier by its impossible dense-attention tensor. See
     # ChunkedBaselineTransformerBlock's docstring: chunk size is NOT
     # automatically bit-exact in floating point (cuBLAS kernel selection can
     # depend on row count), so 4096 is used because it was measured bit-exact
-    # against the unchunked computation at this codebase's actual large-ffn_dim
-    # shape (d_model=1024, ffn_dim=100000), not assumed safe in general.
+    # against the unchunked computation at the legacy misdecoded shape
+    # (d_model=1024, ffn_dim=100000), not assumed safe in general and not
+    # evidence for canonical row 14 (d_model=1024, ffn_dim=1024).
+    # Fallback budget for a device whose capacity cannot be queried (CPU, or
+    # a driver that refuses the property lookup). This was the fixed budget
+    # before step 19 made it capacity-aware.
     _FFN_CHUNK_THRESHOLD_BYTES = 3 * 1024**3
+    # Step 19: the budget above is now a FRACTION OF THE DEVICE'S TOTAL VRAM.
+    # Deliberately `total_memory`, never `mem_get_info()`'s FREE bytes: chunk
+    # size changes cuBLAS kernel selection and therefore the arithmetic (see
+    # ChunkedBaselineTransformerBlock's docstring), so a free-memory-derived
+    # size would make this model's output depend on whatever else happened to
+    # be resident on the card -- non-deterministic numerics, and a different
+    # answer on a re-run of the same shape. total_memory is a hardware
+    # constant, so the decision stays a pure function of (shape, card).
+    # get_device_properties() is a cached host-side lookup, NOT a
+    # device->host sync, so this stays legal inside a captured CUDA graph --
+    # mem_get_info() would sync and poison capture.
+    # 3/16 reproduces the previous fixed 3GB budget EXACTLY on a 16GB card,
+    # so every shape validated before this change keeps its old behaviour and
+    # its old numerics; it scales up on a 24GB card and, the case that
+    # motivated this, scales DOWN on a smaller one instead of overcommitting.
+    _FFN_CHUNK_BUDGET_FRAC = 3.0 / 16.0
+    _FFN_CHUNK_BUDGET_FLOOR_BYTES = 512 * 1024**2
+    # Largest chunk MEASURED bit-exact against the unchunked computation
+    # (legacy d_model=1024, ffn_dim=100000). Never exceeded: chunk size is not
+    # automatically bit-exact, so raising this needs the same measurement
+    # that established it, not an assumption. Shrinking is what the budget
+    # may now do, and stays a fixed shape-and-card-derived constant.
     _FFN_CHUNK_SIZE = 4096
+    # Below this the per-chunk launch overhead dominates the GEMM; a config
+    # that cannot afford 256 rows is pathological on any real card.
+    _FFN_CHUNK_MIN = 256
 
-    def _ffn_chunk_size(self, batch: int, seq_len: int, ffn_dim: int) -> Optional[int]:
+    def _ffn_chunk_budget_bytes(self, device: Optional[torch.device]) -> int:
+        """Bytes of [rows, ffn_dim] fp32 FFN intermediate this device tolerates.
+
+        Pure function of the device -- no allocation, no sync, no dependence
+        on current free memory. See _FFN_CHUNK_BUDGET_FRAC for why.
+        """
+        if device is None or device.type != "cuda":
+            return self._FFN_CHUNK_THRESHOLD_BYTES
+        try:
+            total = torch.cuda.get_device_properties(device).total_memory
+        except Exception:
+            return self._FFN_CHUNK_THRESHOLD_BYTES
+        return max(
+            int(total * self._FFN_CHUNK_BUDGET_FRAC),
+            self._FFN_CHUNK_BUDGET_FLOOR_BYTES,
+        )
+
+    def _ffn_chunk_size(
+        self,
+        batch: int,
+        seq_len: int,
+        ffn_dim: int,
+        device: Optional[torch.device] = None,
+    ) -> Optional[int]:
         total_rows = batch * seq_len
         estimated_bytes = total_rows * ffn_dim * 4
-        if estimated_bytes <= self._FFN_CHUNK_THRESHOLD_BYTES:
+        budget = self._ffn_chunk_budget_bytes(device)
+        if estimated_bytes <= budget:
             return None
-        return min(self._FFN_CHUNK_SIZE, total_rows)
+        # Largest power of two <= the bit-exact-verified _FFN_CHUNK_SIZE whose
+        # own [chunk, ffn_dim] fp32 intermediate also fits the budget. Powers
+        # of two only, so the size lands on the same small set of values a
+        # card can produce rather than an arbitrary row count.
+        rows_in_budget = budget // (ffn_dim * 4) if ffn_dim > 0 else total_rows
+        chunk = min(self._FFN_CHUNK_SIZE, total_rows, max(rows_in_budget, 1))
+        chunk = 1 << (int(chunk).bit_length() - 1)
+        return max(min(chunk, total_rows), min(self._FFN_CHUNK_MIN, total_rows))
 
     @staticmethod
     def _chunked_ffn_fp32(
@@ -3270,7 +3613,8 @@ class UserOptimizedTransformer(BaselineTransformer):
             if mask_active:
                 invalid_keys = ~valid_token_mask[:, None, None, :]  # [B, 1, 1, S]
 
-        chunk_size = self._ffn_chunk_size(batch, seq_len, self.config.ffn_dim)
+        chunk_size = self._ffn_chunk_size(
+            batch, seq_len, self.config.ffn_dim, x.device)
         # dtype the LayerNorm outputs are consumed in. On the fp16-GEMM path
         # every consumer of a normalized activation is an fp16 GEMM, so the
         # cast is folded into the normalization's store.

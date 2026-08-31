@@ -19,7 +19,8 @@ from agent.tools.paths import ARTIFACTS, TOOLS_DIR, agent_path
 
 
 def _git(*args: str) -> str:
-    proc = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True)
+    proc = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True,
+                          text=True, errors="replace")
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"git {' '.join(args)} failed")
     return proc.stdout.strip()
@@ -42,7 +43,8 @@ def _run_arm(args: argparse.Namespace, label: str, value: str, head: str,
     for case in args.case or []:
         cmd += ["--case", case]
     proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, timeout=args.timeout * max(4, args.runs * 3))
+                          text=True, errors="replace",
+                          timeout=args.timeout * max(4, args.runs * 3))
     if proc.returncode != 0:
         raise RuntimeError(f"arm {label} failed:\n{(proc.stdout + proc.stderr)[-5000:]}")
     if not output.is_file():

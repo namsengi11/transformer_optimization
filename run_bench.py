@@ -40,7 +40,7 @@ that these numbers are real). Re-measure with peak_flops.py-style large
 square matmuls if this script ever runs on different hardware.
 
 Usage:
-    python run_bench.py [--suite default|full|quick] [--tag NAME]
+    python run_bench.py [--suite default|full|quick|user_matrix] [--tag NAME]
 """
 from __future__ import annotations
 
@@ -115,6 +115,57 @@ def compute_mfu(shape: dict, latency_ms: float | None) -> float | None:
     achieved_flops_per_s = flops / (latency_ms / 1000.0)
     return achieved_flops_per_s / (peak * 1e12)
 
+
+def _gpu_total_memory_bytes() -> int | None:
+    """Return the first visible GPU's total memory without creating a CUDA context."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        first = proc.stdout.splitlines()[0].strip()
+        return int(first) * 1024**2
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+def preflight_case(extra: list[str]) -> dict | None:
+    """Reject a shape whose baseline score tensor cannot fit on the GPU.
+
+    BaselineSelfAttention explicitly materializes one fp32/fp16/bf16
+    ``[batch, heads, seq_len, seq_len]`` score tensor. This is a strict lower
+    bound, not a fitted peak-memory estimate: if that tensor alone exceeds
+    total device memory, launching the child can only OOM.
+    """
+    shape = resolve_shape(extra)
+    element_bytes = 4 if shape["dtype"] == "float32" else 2
+    score_bytes = (
+        shape["batch_size"]
+        * shape["heads"]
+        * shape["seq_len"]
+        * shape["seq_len"]
+        * element_bytes
+    )
+    device_bytes = _gpu_total_memory_bytes()
+    if device_bytes is None or score_bytes <= device_bytes:
+        return None
+    return {
+        "status": "PREFLIGHT_BLOCKED",
+        "reason": (
+            "one dense baseline attention-score tensor exceeds total GPU memory"
+        ),
+        "score_tensor_bytes": score_bytes,
+        "gpu_total_memory_bytes": device_bytes,
+    }
+
 # name -> extra CLI args. Every case compiles the BASELINE (the bar to beat).
 SUITES = {
     "quick": {
@@ -147,13 +198,12 @@ SUITES = {
                               "--layers", "12", "--batch-size", "16",
                               "--seq-len", "256"],
     },
-    # User-supplied grading matrix. Columns as given were unlabeled; inferred
-    # order (batch_size, seq_len, num_heads, ffn_dim, num_layers, causal,
-    # d_model) from the unique mapping that keeps every row satisfying
-    # d_model % num_heads == 0 and physically constructible on this GPU (the
-    # alternative reading puts d_model=100000 on row 14, a 40GB weight matrix
-    # that can't be allocated at all). fp32 dtype (harness default); dtype
-    # was not part of the given matrix.
+    # Authoritative user-supplied grading matrix. The source columns are:
+    # case_id, batch_size, d_model (QKV dim), heads, seq_len, layers,
+    # ffn_dim, causal. dtype is not a source column, so the harness default
+    # fp32 applies. Keep the case names aligned with the axis varied by the
+    # source row; see agent/docs/USER_MATRIX.md for the canonical table and
+    # the 2026-08-31 schema correction.
     "user_matrix": {
         "01_base":        ["--batch-size", "64",    "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
         "02_batch1":      ["--batch-size", "1",      "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
@@ -161,14 +211,14 @@ SUITES = {
         "04_batch16":     ["--batch-size", "16",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
         "05_batch128":    ["--batch-size", "128",    "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
         "06_batch10000":  ["--batch-size", "10000",  "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
-        "07_seq32":       ["--batch-size", "64",     "--seq-len", "32",   "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "32"],
-        "08_seq1024":     ["--batch-size", "64",     "--seq-len", "1024", "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "1024"],
+        "07_dmodel32":    ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "32",     "--layers", "4", "--causal", "--d-model", "32"],
+        "08_dmodel1024":  ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "1024",   "--layers", "4", "--causal", "--d-model", "1024"],
         "09_heads1":      ["--batch-size", "64",     "--seq-len", "128",  "--heads", "1",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
         "10_heads2":      ["--batch-size", "64",     "--seq-len", "128",  "--heads", "2",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
         "11_heads16":     ["--batch-size", "64",     "--seq-len", "128",  "--heads", "16", "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
-        "12_ffn32":       ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "32",     "--layers", "4", "--causal", "--d-model", "128"],
-        "13_ffn1024":     ["--batch-size", "64",     "--seq-len", "128",  "--heads", "4",  "--ffn-dim", "1024",   "--layers", "4", "--causal", "--d-model", "128"],
-        "14_extreme":     ["--batch-size", "32",     "--seq-len", "1024", "--heads", "16", "--ffn-dim", "100000", "--layers", "2", "--causal", "--d-model", "1024"],
+        "12_seq32":       ["--batch-size", "64",     "--seq-len", "32",   "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "13_seq1024":     ["--batch-size", "64",     "--seq-len", "1024", "--heads", "4",  "--ffn-dim", "128",    "--layers", "4", "--causal", "--d-model", "128"],
+        "14_extreme":     ["--batch-size", "32",     "--seq-len", "100000", "--heads", "16", "--ffn-dim", "1024", "--layers", "2", "--causal", "--d-model", "1024"],
     },
 }
 
@@ -258,6 +308,36 @@ def main() -> int:
 
     results = []
     for name, extra in cases.items():
+        preflight = preflight_case(extra)
+        if preflight is not None:
+            shape = resolve_shape(extra)
+            row = {
+                "name": name,
+                "cmd": " ".join([str(SCRIPT), *extra]),
+                "status": preflight["status"],
+                "accuracy": None,
+                "max_abs": None,
+                "max_rel": None,
+                "eager_baseline_ms": None,
+                "compiled_baseline_ms": None,
+                "optimized_ms": None,
+                "speedup_vs_compiled": None,
+                "speedup_vs_eager": None,
+                "mfu_optimized": None,
+                "mfu_compiled_baseline": None,
+                "fp16_gemm_enabled": None,
+                "wall_s": 0.0,
+                "shape": shape,
+                "preflight": preflight,
+            }
+            results.append(row)
+            print(
+                f"[run_bench] {name} PREFLIGHT_BLOCKED: "
+                f"{preflight['score_tensor_bytes']} score bytes > "
+                f"{preflight['gpu_total_memory_bytes']} GPU bytes",
+                flush=True,
+            )
+            continue
         print(f"[run_bench] {name} (correctness vs eager baseline) ...", flush=True)
         acc_run = run_case(name, extra, False, args.compile_user, args.timeout)
 
@@ -288,6 +368,7 @@ def main() -> int:
         r = {
             "name": name,
             "cmd": acc_run.get("cmd"),
+            "status": "EXECUTED",
             "accuracy": acc_run.get("accuracy"),
             "max_abs": acc_run.get("max_abs"),
             "max_rel": acc_run.get("max_rel"),
@@ -344,8 +425,12 @@ def main() -> int:
         avg_mfu_bar = statistics.fmean(mfu_bar_ok)
         print(f"average MFU (compiled baseline) across {len(mfu_bar_ok)}/{len(results)} "
               f"cases: {100*avg_mfu_bar:.2f}%")
-    n_pass = sum(1 for r in results if r["accuracy"] == "PASS")
-    print(f"accuracy: {n_pass}/{len(results)} cases PASS vs eager baseline")
+    executed = [r for r in results if r["status"] == "EXECUTED"]
+    n_pass = sum(1 for r in executed if r["accuracy"] == "PASS")
+    n_blocked = sum(1 for r in results if r["status"] == "PREFLIGHT_BLOCKED")
+    print(f"accuracy: {n_pass}/{len(executed)} executed cases PASS vs eager baseline")
+    if n_blocked:
+        print(f"preflight: {n_blocked}/{len(results)} cases structurally blocked")
 
     outdir = Path("results")
     outdir.mkdir(exist_ok=True)

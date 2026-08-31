@@ -19,9 +19,10 @@ number that affects a new decision with `agent/tools/` and store the resulting a
 ## 2. Inherited standing
 
 The legacy log reported, at its recorded checkout and environment, 1.207x geomean versus the
-compiled bar on the default suite, 3.764x on the graded matrix, and 55.6% average MFU. These
-figures are a starting hypothesis only until the continuous agent records a trusted current-
-main baseline.
+compiled bar on the default suite. It also reported 3.764x on the graded matrix and 55.6%
+average MFU, but those matrix figures used the pre-2026-08-31 misdecoded shapes for rows 7,
+8, 12, 13, and 14. They are invalid for the canonical matrix and must not be used as a
+starting hypothesis or comparison baseline. See `agent/docs/USER_MATRIX.md`.
 
 ## 3. Agent experiment index
 
@@ -38,6 +39,12 @@ main baseline.
 
 Add only durable protocol or environment observations that affect interpretation of more than
 one experiment. Put step-specific detail in `agent/experiments/NN-slug/result.md`.
+
+- **2026-08-31 matrix schema correction:** the authoritative columns are `batch_size`,
+  `d_model`, `heads`, `seq_len`, `layers`, `ffn_dim`, `causal`. Old artifacts named
+  `07_seq32`, `08_seq1024`, `12_ffn32`, or `13_ffn1024` executed different shapes and are
+  not corrected-matrix evidence. Rows 1-13 require a fresh baseline; row 14 is retained as
+  a structural preflight block. Canonical values: `agent/docs/USER_MATRIX.md`.
 
 ## Step records
 

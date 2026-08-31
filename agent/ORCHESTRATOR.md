@@ -19,10 +19,12 @@ Run this sequence before proposing or editing anything:
 6. Run `git log --oneline -20` and `git branch -a`. Derive the next step number from the
    agent experiment index. The first continuous-agent step is 18.
 
-Do not read the entire legacy optimization log. Its recorded standing was 1.207x geomean
-versus the compiled bar on the default suite, 3.764x on the graded matrix, and 55.6% average
-MFU; treat those numbers as inherited context until the agent reproduces a trusted current-
-main baseline.
+Do not read the entire legacy optimization log. Its recorded default-suite standing was
+1.207x geomean versus the compiled bar. The reported 3.764x graded-matrix geomean and 55.6%
+average MFU used the pre-2026-08-31 misdecoded shapes and are invalid for the canonical
+matrix; do not use them as inherited standing or comparison evidence. Read
+`agent/docs/USER_MATRIX.md` and run `python agent/tools/check_user_matrix.py` before any
+matrix measurement.
 
 ## 1. Invariants
 
@@ -68,8 +70,10 @@ These rules are not optimization candidates.
 Promote step N only when all conditions hold:
 
 1. `agent/tools/bench.py --suite default` reports 5/5 PASS.
-2. `agent/tools/bench.py --suite user_matrix` reports 13/13 PASS. Exclude `14_extreme` only when a
-   trusted run shows it already fails on the pinned main SHA.
+2. `agent/tools/bench.py --suite user_matrix` reports 13/13 PASS for executable rows 1-13.
+   `14_extreme` remains recorded as `PREFLIGHT_BLOCKED` because its dense score-tensor lower
+   bound exceeds device capacity; never launch its allocation. The exact schema and block
+   calculation are in `agent/docs/USER_MATRIX.md`.
 3. At least one of these is true:
    - median `optimized_ms` improves on at least one suite with non-overlapping min/max ranges
      over at least three independent runs, and no suite regresses more than 2%; or
