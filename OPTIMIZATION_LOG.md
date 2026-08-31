@@ -98,8 +98,12 @@ Each step was developed on its own branch and merged only after measurement.
 | 9 | inductor-generated layout copies (bit-exact) | **1.189x** | 5/5 |
 | 10 | investigated fp8 weight quantization -- **no change merged** | 1.189x (unchanged) | 5/5 |
 | 11 | two shape-specialized Triton kernels for the graded shapes | 1.172x default suite; **3.764x** geomean on the graded matrix | 5/5 + 13/13 (+ 60/60 sweep) |
+| 12 | base-2 softmax in the short-sequence attention kernel | **1.088x** on the graded matrix | 5/5 |
+| 13 | fused GEMM+GELU for the FFN's first projection | 1.172x -> **1.207x** default suite | 5/5 |
 | 14 | block-triangular causal Q@K^T (bit-exact) | default suite unchanged; **1.068x** on long_causal_fp16 | 5/5 |
+| 15 | fix silent CUDA-graph capture failure under `torch.no_grad()` | default suite unchanged; **2.3x** for no_grad callers | 5/5 |
 | 16 | triangular causal scale+mask, persistent -inf buffer (bit-exact) | default suite unchanged; **1.112x** on long_causal_fp16 | 5/5 |
+| 17 | q/k/v, out_proj and ffn_out on the Triton GEMM | **1.086x** on the graded matrix | 5/5 |
 
 \* flat within the bar's noise; the optimized latency itself dropped 4-5% on the
 causal and padded cases.
@@ -947,6 +951,91 @@ whole score matrix, fits in one block) that the general-purpose kernel cannot
 assume.
 
 
+### Step 12 - base-2 softmax in the short-sequence attention kernel
+
+Step 11's attention kernel was the largest single item left at
+`11_heads16` (75.6 us/layer, 49.5% of the layer). The obvious explanation was
+wrong, and finding that out is the useful part.
+
+**Not tensor-core padding, and not memory layout.** head_dim=8 forces
+`BLOCK_D = max(16, 8)`, so half of every operand is zero padding -- but
+feeding the kernel contiguous `[B, H, S, HD]` tensors instead of the packed
+column slices it normally gets changed nothing (19.97 vs 19.60 us at
+head_dim=32; 72.48 vs 72.09 at head_dim=8), and head_dim=16, which pads not
+at all, was still 1.55x slower than head_dim=32.
+
+What the kernel's cost actually tracks is **score-matrix elements**, not
+FLOPs:
+
+| H | head_dim | us | score elements | G elem/s |
+|---|---|---|---|---|
+| 4 | 32 | 19.97 | 4.19M | 210 |
+| 8 | 16 | 31.05 | 8.39M | 270 |
+| 16 | 8 | 72.48 | 16.8M | 232 |
+
+The FLOP count is identical across those rows; the element count differs 4x,
+and so does the time. At fixed d_model, halving head_dim doubles `B*H*S^2`.
+So `11_heads16` was not wasting 4x -- it was *doing* 4x the softmax work, and
+most of the "slack" attributed to it was not recoverable at all.
+
+That reframes the target as per-score-element work, and two things there were
+free to remove:
+
+* **exp2 instead of exp**, with log2(e) folded into the qk scale at the call
+  site. exp2 is one hardware instruction; exp is a multiply plus that.
+* **clamping a fully-masked row's max to 0** instead of leaving it at -inf and
+  repairing the resulting NaN afterwards. exp2(-inf) is then 0 for the whole
+  row by construction, which makes the post-exp `tl.where` -- which also ran
+  over every score element -- redundant.
+
+Kernel-level: 1.50x at head_dim=8 (72.6 -> 48.5 us), 1.29x at head_dim=32,
+2.24x at the seq_len=32 shape. In-model **1.088x** geomean over the graded
+matrix, 1.200x at `11_heads16`, 1.606x at `02_batch1`.
+
+Two cases first measured as regressions (`07_seq32` 0.848x, `03_batch4`
+0.962x) and did not survive repetition -- five runs per arm put both at
+1.00-1.02x, with *main's own* samples spanning 25%. See the measurement note
+at the end of this section for why that shape is so noisy.
+
+### Step 13 - fused GEMM + GELU for the FFN's first projection
+
+Steps 7 and 11 both concluded a hand-written Triton GEMM does not beat
+cuBLAS here. That is true, and it is also the wrong bar. The fused kernel
+does not have to beat cuBLAS's GEMM -- it has to beat **cuBLAS's GEMM plus a
+separate ATen GELU pass**, because fusing deletes a write-then-read of the
+whole `[rows, ffn_dim]` hidden tensor (32 MB at `13_ffn1024`, exactly this
+card's L2 capacity, so it is real DRAM traffic). cuBLAS runs that GEMM in
+79.2 us and the GELU costs another 43.7, so Triton only needs ~65% of
+cuBLAS's throughput to win.
+
+| shape (M x K x N) | cuBLAS + GELU | fused | ratio | bit-exact |
+|---|---|---|---|---|
+| 8192 x 128 x 1024 | 113.92 | 63.14 | **1.80x** | yes |
+| 2048 x 32 x 128 | 4.00 | 2.59 | 1.54x | yes |
+| 16384 x 128 x 128 | 26.75 | 18.02 | 1.48x | yes |
+| 8192 x 128 x 128 | 14.45 | 10.02 | 1.44x | yes |
+| 65536 x 1024 x 128 | 437.42 | 386.37 | 1.13x | no |
+| 1024 x 512 x 2048 | 56.67 | 52.23 | 1.09x | no |
+| 8192 x 128 x 32 | 5.25 | 6.05 | 0.87x | yes |
+| 128 x 128 x 128 | 2.33 | 2.85 | 0.82x | yes |
+
+**Bit-exact at six of eight shapes** -- `torch.equal`, not "close" -- for two
+deliberate reasons: libdevice's `erf` is the function ATen's GELU calls, and
+the accumulator is rounded to the output dtype *before* the GELU, because
+`F.linear` materializes a real fp16 tensor that ATen's GELU then reads.
+Carrying fp32 into the epilogue would be more accurate than the reference,
+which this project counts as divergence too. The two inexact shapes are the
+two with a long reduction axis, where Triton's k-loop order differs from
+cuBLAS's; they differ by 3.8e-6, i.e. fp32 rounding.
+
+Because it can be bit-exact it is offered on the fp16/bf16 paths as well,
+with a `torch.equal` bar -- and it passes there (0/524288 differing for both
+default_fp16 and default_bf16). Default suite geomean vs the compiled bar
+**1.172x -> 1.207x**, every case improved, fp16/bf16 still max_abs 0.
+
+The two losing shapes are excluded by a measured row/width floor, documented
+as empirical like the step 5 chunk size.
+
 ### Step 14 — block-triangular causal Q@K^T (bit-exact)
 
 Causal attention computes the full `[S,S]` score matrix and throws away the
@@ -1033,6 +1122,37 @@ it is not mistaken for a regression from this step: `--dtype bfloat16
 `max_abs=0.046875` (~6 bf16 ulps). It reproduces identically with and
 without this step's change, so it predates it. Not diagnosed here.
 
+### Step 15 - fix a silent CUDA-graph capture failure under `torch.no_grad()`
+
+Not a performance idea -- a bug, found because a scratch benchmark harness
+reported fp16 numbers 2.3x worse than `run_bench.py` did for the same commit.
+
+**dynamo specializes compiled code on the DISPATCH KEY SET**, not only on
+shape and stride. The step 9 layout helpers are compiled while
+`_resolve_compiled_layout`'s probe runs under `torch.inference_mode()`, so a
+caller running the model under `torch.no_grad()` -- the ordinary inference
+idiom -- is a cache miss. The recompile then lands at the first such call,
+which is *inside* `torch.cuda.graph()`, where it hits the Windows
+static-launcher `OverflowError`, fails the capture, and permanently demotes
+the model to eager.
+
+| | inference_mode | no_grad |
+|---|---|---|
+| fp16 | 1.55 ms | **3.62 ms** (capture failed) |
+| bf16 | 1.30 ms | **3.21 ms** (capture failed) |
+| fp32 | 1.16 ms | 1.17 ms (unaffected) |
+
+fp32 escapes because its SDPA path never uses the compiled helpers. The
+harness uses `inference_mode` throughout, which is the only reason this never
+appeared in any benchmark -- it was correct-but-slow, silently, for anyone
+using the standard idiom.
+
+This is the step 9 trap on a different specialization axis, so the fix is the
+general one rather than another attempt to enumerate which variants must be
+pre-compiled: hold the static-launcher patch across the whole warmup +
+capture region, so a late recompile anywhere inside it is safe. It costs
+nothing at steady state -- replay never goes through the Python launcher.
+
 ### Step 16 — triangular causal scale+mask (bit-exact)
 
 Step 14 stopped computing the above-diagonal half of `Q@K^T`. This step
@@ -1100,10 +1220,93 @@ per-call `torch.empty_like` the full-width path allocated, so steady-state
 footprint is comparable, but it is not returned to the allocator between
 forwards.
 
+### Step 17 - q/k/v, out_proj and ffn_out on the Triton GEMM
+
+This **overturns steps 7 and 11 for these shapes**, and the way they went
+wrong is worth more than the change itself.
+
+Step 7 benchmarked at the *default* shape (d_model=512), where cuBLAS is
+genuinely ahead for the FFN's wide-K projection. Step 11 then argued from a
+K-sweep -- 9.2 TFLOP/s at K=32, 24.8 at K=128, 40.4 at K=512, plateau ~45 --
+that d_model=128 pins these GEMMs to a short-reduction ceiling cuBLAS was
+already sitting on. **That sweep only ever compared cuBLAS against cuBLAS.**
+It established the ceiling's shape correctly and then *assumed* cuBLAS
+reached it. It does not: at the narrow-N projections these shapes produce
+(N = d_model or 3*d_model, d_model 32 or 128) cuBLAS dispatches to a wmma
+kernel that a plain Triton GEMM beats outright.
+
+| shape (M x K x N) | cuBLAS | Triton | ratio | bit-exact |
+|---|---|---|---|---|
+| qkv 16384 x 128 x 384 | 90.88 | 44.10 | **2.06x** | yes |
+| qkv 8192 x 128 x 384 | 29.12 | 20.32 | 1.43x | yes |
+| out_proj 1024 x 512 x 512 | 22.81 | 14.64 | 1.56x | yes |
+| ffn_out 8192 x 32 x 128 | 6.42 | 4.23 | 1.52x | yes |
+| out_proj 16384 x 128 x 128 | 19.22 | 14.55 | 1.32x | yes |
+| out_proj 8192 x 128 x 128 | 10.30 | 9.13 | 1.13x | yes |
+| qkv 1024 x 512 x 1536 | 52.14 | 46.95 | 1.11x | yes |
+| ffn_out 8192 x 1024 x 128 | 55.82 | 55.36 | 1.01x | no |
+| qkv 128 x 128 x 384 | 2.17 | 2.45 | 0.89x | excluded |
+
+Reuses `_gemm_gelu_kernel` with the epilogue off, so there is one GEMM
+implementation and one autotune cache; the autotune key includes the epilogue
+flag, since `ffn_in` (with GELU) and `out_proj` (without) can share an
+(M, N, K) and want different configs. Bit-exact at every shape with K <= 512,
+so it is offered on fp16/bf16 too -- measured verdicts: every fp32 graded
+shape enables, `default_bf16` enables (0/524288 differing), `default_fp16`
+correctly refuses (188379 differing).
+
+In-model, toggling the probe on a fixed checkout, 3 repeats per arm on an
+idle GPU: **1.086x geomean** over the graded matrix, positive on 14 of 15
+cases (1.28x at `02_batch1`, 1.24x at `07_seq32`, 1.15x at `10_heads2`), and
+no uncontended case regressing.
+
+### Measurement notes (steps 12-17)
+
+Three ways to get a confidently wrong number here, all encountered:
+
+* **Eager microbenchmarks of small kernels rank launch overhead, not the
+  kernel.** Triton's Python-side launch is ~25 us; at these shapes that
+  exceeds the kernel. The same attention kernel measured 47.4 us eagerly and
+  19.97 us under graph replay. Every measurement in these steps goes through a
+  CUDA-graph helper with an empty-graph replay subtracted.
+* **Isolated per-op timing keeps everything L2-resident.** A first attempt at
+  a per-op roofline scored ops against DRAM bandwidth and produced `add_ln`
+  at "2022 GB/s", above the DRAM roof. This card has **32 MiB of L2 at
+  ~1500 GB/s** with a sharp cliff to ~385 GB/s beyond it (measured), and a
+  whole layer of the graded shapes fits inside it. Scoring against the wrong
+  roof invents headroom that does not exist -- it is what produced the
+  incorrect "the GEMMs are bandwidth-bound at 78% of roof" claim that step 17
+  had to retract.
+* **`07_seq32`-class shapes swing 25% between identical runs**, for two
+  independent reasons. (a) The GPU idles at **442 MHz against a 3090 MHz
+  max**; at a 70 us forward with a sync after every call it never ramps, and
+  the distribution is heavily right-skewed (median 0.093-0.122 ms, min 0.064,
+  max 0.327). Timing 50 calls back-to-back instead gives 0.065-0.078 ms and a
+  tight spread. (b) The autotuner picks a **different config every run** at
+  that size -- four runs of `_short_attn_kernel` chose BLOCK_Q/warps of 32/4,
+  32/8, 128/4 and 32/2 -- because it benchmarks 1-2 us candidates whose
+  differences are inside its own noise.
+
+And one that is specific to this machine rather than to the code: **this repo
+is worked on by more than one agent session at a time.** Two consequences,
+both of which produced wrong answers before being caught:
+
+* A/B by `git checkout branch` vs `main` is **invalid** when `main` can move
+  mid-measurement. One such run reported the Triton-GEMM change at 0.913x,
+  reproducibly, across two attempts -- because the other session had already
+  merged that change into `main` and added an optimization on top, so the
+  comparison was measuring *their* change's absence. `git rev-list
+  --left-right --count` showed the branch was 0 commits ahead, 3 behind. The
+  numbers above come from toggling one probe on a **fixed checkout** instead.
+* Benchmarks silently ran while the GPU was at **100% utilization** from the
+  other session. Measurement scripts now poll `nvidia-smi`, wait for an idle
+  GPU before each case, and flag any case where utilization spiked during it.
+
 ## 4. Rejected after measurement
 
 | idea | why rejected |
 |---|---|
+| Fused GEMM + residual-add + LayerNorm epilogue | Rejected at the shapes it was designed for. LayerNorm reduces over d_model, so the epilogue needs one BLOCK_N tile to span the whole row -- which removes the N-axis parallelism, and `tl.dot`'s BLOCK_M >= 16 floor then caps the grid at M/16 blocks: 8 blocks for 36 SMs at batch=1. Measured 0.72-0.85x at exactly the tiny shapes whose per-kernel floor motivated it (1.62x at 13_ffn1024, but that win is available more simply via step 17). |
 | **KV caching** | Not applicable. The harness does one full-sequence forward per call, with no autoregressive decode and no cross-call state. There is no incremental step to cache K/V for, and caching across identical benchmark calls would just memoise the answer. |
 | `torch.compile` on our own model (fp16/bf16) | Changes numerics past tolerance vs the eager reference — the same drift that makes the compiled baseline non-compliant. |
 | Whole-model fp16 / bf16 cast | fp16 max_abs 0.0082, bf16 0.074 — both fail. |
@@ -1112,7 +1315,7 @@ forwards.
 | ~~Fused QKV in fp16/bf16~~ | **Overturned in step 8.** Not kernel selection at all -- the fused and separate GEMMs dispatch to the *same* cutlass kernel. bf16 is bit-exact at every shape tried; fp16 at most. Now decided per-shape by a warmup `torch.equal` probe. |
 | **fp8 weight quantization (e4m3, incl. MX block-32 group scales)** | Fails twice over (step 10). Accuracy: e4m3's own relative precision (2.71% rel_rms) **exceeds the harness's 2% rtol**, so no placement works -- even ONE matrix in ONE layer, weight-only with an exact fp32 GEMM, lands at 2.3x the atol, while fp16 across the whole model uses 64% of the budget. Group scaling is inert here (identical error at every granularity: these untrained weights have no outliers to isolate). Speed: activation quantization costs 4-8x what the faster GEMM saves -- 0.26x vs the fp16 path at the default shape -- despite mxfp8 hitting a genuine ~147 TFLOPS (3.3x fp16) in isolation. |
 | Triton fused softmax reduction | Reduction tree differs from ATen; compounds to 0.0078 over 6 layers. Still true for fp16/bf16; step 11's short-sequence attention kernel does exactly this and is therefore fp32-only, gated on the calibration bar. |
-| Triton GEMM for the graded shapes' narrow-N matmuls | Step 7's conclusion holds, but for a different reason at these shapes: at K=128 the GEMMs are bandwidth-bound and cuBLAS already runs at ~78% of the card's bandwidth roof, capping any possible win at ~1.28x. The low fp16 TFLOPS figure is the wrong yardstick. |
+| ~~Triton GEMM for the graded shapes' narrow-N matmuls~~ | Step 7's conclusion holds, but for a different reason at these shapes: at K=128 the GEMMs are bandwidth-bound and cuBLAS already runs at ~78% of the card's bandwidth roof, capping any possible win at ~1.28x. The low fp16 TFLOPS figure is the wrong yardstick. **Overturned in step 17**: that analysis compared cuBLAS only against cuBLAS, and scored the ops against DRAM bandwidth when their working set is L2-resident. A plain Triton GEMM beats cuBLAS 1.1x-2.1x at these narrow-N shapes, bit-exact. |
 | Inductor max-autotune GEMM (or a hand-written Triton GEMM) | Disabled on this GPU by inductor's SM-count gate (36 < 68 SMs); bypassed it and also hand-tuned a Triton GEMM for this exact hardware in step 7 -- cuBLAS still wins or ties at every shape this codebase actually runs. |
 
 ## 5. Behaviour against a compiled baseline
