@@ -1,9 +1,9 @@
 # Step 23: general 85%-VRAM streaming autotuner
 
-- Status: SELECTED
+- Status: PROMOTED
 - Branch: `opt/23-streaming-autotune`
 - Pinned main SHA: `ba933aa7a8f1b0db398898ecd9416510c936b5f5`
-- Pinned experiment SHA: pending
+- Pinned experiment SHA: `d115f513fb999cc4ba2ff5a3b06cd59a86b72a2b`
 - Started UTC: 2026-08-31T20:29:27Z
 
 ## Claim
@@ -12,6 +12,10 @@ For any capacity-streamed shape, independently selecting the optimized batch sha
 reference query tile from `(B,S,D,H,FFN,dtype,installed VRAM)` under an 85% measured-memory
 target will reduce long-case latency and raise optimized MFU versus the conservative shared
 65%/10% plan, without benchmark-name or exact-shape specialization.
+
+The capacity target is a ceiling, not a requirement to fill every byte. Candidate selection
+maximizes useful work under that ceiling and may deliberately use less memory when a larger
+candidate is slower or crosses the allocator-reserved limit.
 
 ## Evidence and prior art
 

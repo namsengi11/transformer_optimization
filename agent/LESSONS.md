@@ -163,6 +163,19 @@ Step 22 is a second application: its Inductor/Triton hypothesis was stopped befo
 or measurement when general long-sequence autotuning became the explicit priority. It
 remains eligible for a later revisit.
 
+## A VRAM target is a ceiling, not a performance objective
+
+**Lesson:** Choose the fastest work unit below the memory ceiling; do not maximize residency.
+
+**Evidence:** In step 23, row-14 optimized batch 2 fit but was about 2% slower per element
+than batch 1 including transfers. Reference query 384 was only about 1.7% faster than 256,
+while a different long shape showed that a larger nominally feasible tile could OOM on a
+3.14 GiB transient GEMM allocation.
+
+**How to apply:** Gate streaming at 85% of installed VRAM, reserve transient workspace,
+prefer measured-efficient tile families, and stop optimized batching once `B*S` reaches the
+calibrated throughput region. Validate a second long shape before generalizing a reserve.
+
 ## Rejections remain live evidence
 
 **Lesson:** A rejection is scoped to its measured mechanism and can be overturned only by new

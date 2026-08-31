@@ -97,7 +97,7 @@ model instance.
 | FFN input GEMM + GELU | **Handwritten Triton** | `batch*seq >= 256`, `ffn_dim >= 64`, and no capacity chunking | Applies GELU in the GEMM epilogue after rounding at the same point as the materialized PyTorch linear output. It deletes a launch and the write/read round trip of the FFN hidden tensor. | cuBLAS linear + ATen GELU |
 | QKV/output/FFN-output projections | **Handwritten Triton**, using the GEMM kernel with GELU disabled | `batch*seq >= 1024`, then complete-forward accuracy gate | Narrow-N cuBLAS kernels underfill this GPU on several test shapes; the autotuned Triton tiling exposes more useful blocks. | cuBLAS-backed `F.linear` |
 | Layout copies | **Inductor-generated Triton**, not handwritten | Only where a materialized split or merge copy is required, then bit-exact complete-forward gate | Replaces ATen's general strided copy with a tiled copy. This is secondary on the target path. | ATen view/copy/reshape |
-| Capacity streaming | **PyTorch orchestration + SDPA**; tiled eager reference uses PyTorch GEMMs | Dense peak estimate above 65% of installed VRAM | Streams independent batch shards and tiles reference query rows so no full `[B,H,S,S]` score tensor or full resident input/output is required. | Ordinary dense execution below the gate |
+| Capacity streaming | **PyTorch orchestration + SDPA**; tiled eager reference uses PyTorch GEMMs | Dense peak estimate above 85% of installed VRAM | Independently sizes optimized batch shards and reference batch/query tiles so no full `[B,H,S,S]` score tensor or full resident input/output is required. | Ordinary dense execution below the gate |
 
 The support boundaries are measured limits for this GPU and software stack, not
 claims that the kernels are universally optimal outside those regions.
@@ -133,25 +133,33 @@ Dense execution is replaced by streaming when:
 6 * (B*S*D*element_bytes)
 + 2 * (B*H*S*S*element_bytes)
 + 2 * (B*S*FFN*element_bytes)
-    > 65% of installed VRAM
+    > 85% of installed VRAM
 ```
 
 Installed capacity is used rather than current free memory, so routing is stable
 and does not depend on other GPU processes.
 
 The input remains on CPU and independent batch shards are transferred to CUDA.
-The optimized side uses memory-efficient SDPA. The naive reference retains all
-keys and values but evaluates fixed query tiles, so it preserves full causal
-attention rather than substituting a local or sparse window. Its attention
-workspaces are reused, unreachable future causal-key tiles are skipped, and the
-query tile is limited to 10% of installed VRAM. Outputs are compared and released
-one shard at a time.
+The optimized side uses memory-efficient SDPA and the smallest capacity-safe batch
+shard that reaches the calibrated 8192-token throughput region. The naive reference
+retains all keys and values but evaluates independently
+sized batch/query tiles, so it preserves full causal attention rather than
+substituting a local or sparse window. Its attention workspaces are reused and
+unreachable future causal-key tiles are skipped. The reference workspace consumes
+the capacity remaining after estimated parameters and resident activations, with a
+measured 1.50x reserve for allocator rounding and GEMM workspace. One optimized CPU
+shard may therefore be subdivided into several reference shards; comparisons use
+the corresponding slices of the identical input and optimized output.
 
 For the extreme test shape `B=32, S=100000, D=1024, H=16, layers=2`, one float32
 dense attention-score tensor alone would require 20.48 TB. The input and output
-are each 13.1 GB. This shape therefore selects batch/query streaming. The path is
-implemented and validated on feasible long-sequence surrogates, but a complete
-accuracy-and-timing result for the full extreme shape has not yet been recorded.
+are each 13.1 GB. This shape selects reference batch 1/query 256 and optimized
+batch 1 on the pinned 16 GiB GPU. Reference query 512 reserves 91.8% and optimized
+batch 3 reserves 90.2%, both above the 85% target. Optimized batch 2 fits, but a
+clean end-to-end sweep measured 1.983 seconds per element versus 1.943 seconds for
+batch 1; it is rejected because extra residency reduced throughput. The path is
+validated on feasible long-sequence surrogates; the current full-shape validation
+status is recorded with the step-23 experiment.
 
 ## Latest test-shape benchmark
 
