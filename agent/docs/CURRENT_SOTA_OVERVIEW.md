@@ -153,7 +153,7 @@ the corresponding slices of the identical input and optimized output.
 
 For the extreme test shape `B=32, S=100000, D=1024, H=16, layers=2`, one float32
 dense attention-score tensor alone would require 20.48 TB. The input and output
-are each 13.1 GB. This shape selects reference batch 1/query 384 and optimized
+are each 13.1 GB. This shape selects reference batch 1/query 256 and optimized
 batch 1 on the pinned 16 GiB GPU. Reference query 512 reserves 91.8% and optimized
 batch 3 reserves 90.2%, both above the 85% target. Optimized batch 2 fits, but a
 clean end-to-end sweep measured 1.983 seconds per element versus 1.943 seconds for

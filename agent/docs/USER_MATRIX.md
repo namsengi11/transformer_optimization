@@ -59,10 +59,11 @@ The query-tiled reference no longer receives a fixed percentage of memory. The p
 subtracts estimated parameters and per-batch resident state from the 85% target, then sizes
 the simultaneous score/probability workspace from the remainder. A shape-independent 1.50x
 workspace reserve, measured with isolated candidate processes, covers allocator block rounding
-and GEMM workspace. Candidates are aligned to 64 query rows; there is no benchmark-name or
-exact-shape predicate. On row 14 this selects reference batch 1/query 384 and optimized batch
-1: query 384 measured 12.40 GB reserved (72.5%); query 448 was only 0.26% faster, and a second
-long shape showed that the earlier 1.35x reserve could cross the 85% ceiling. Query 512 measured
+and GEMM workspace. Power-of-two query candidates are used because a second long-shape sweep
+found query 2048 faster than 2304 while 2560 OOMed; there is no benchmark-name or exact-shape
+predicate. On row 14 this selects reference batch 1/query 256 and optimized batch 1. Query 384
+measured 12.40 GB reserved but was only 1.7% faster than query 256, and a second long shape showed
+that the earlier 1.35x reserve could cross the 85% ceiling. Query 512 measured
 15.70 GB (91.8%) and was rejected. Optimized batch 2 is capacity-safe but its end-to-end latency was
 1.983 seconds per element versus 1.943 seconds for batch 1, so filling more memory was slower;
 batch 3 measured 15.43 GB (90.2%) and was rejected on capacity.

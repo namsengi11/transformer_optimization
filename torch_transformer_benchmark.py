@@ -89,7 +89,6 @@ _STREAMING_MEMORY_BUDGET_FRAC = 0.85
 # are included. This calibrated multiplier is shape-independent; the remaining
 # terms below still scale from the requested shape and dtype.
 _STREAMING_REFERENCE_WORKSPACE_RESERVE = 1.50
-_STREAMING_QUERY_ALIGNMENT = 64
 # Dense matrix rows reach their stable throughput region around 8192 tokens
 # per launch (for example B=64,S=128). More batch above that point needlessly
 # raises residency for already-long sequences and can reduce per-token latency.
@@ -4014,14 +4013,9 @@ def _estimated_streaming_model_bytes(
     return 2 * one_model_elements * element_bytes
 
 
-def _aligned_query_tile(value: int, seq_len: int) -> int:
+def _query_tile_candidate(value: int, seq_len: int) -> int:
     value = max(1, min(value, seq_len))
-    if value < _STREAMING_QUERY_ALIGNMENT:
-        return value
-    return max(
-        _STREAMING_QUERY_ALIGNMENT,
-        (value // _STREAMING_QUERY_ALIGNMENT) * _STREAMING_QUERY_ALIGNMENT,
-    )
+    return 1 << (value.bit_length() - 1)
 
 
 def _streaming_shard_plan(
@@ -4070,7 +4064,7 @@ def _streaming_shard_plan(
             1,
             min(config.seq_len, available_query_bytes // max(1, bytes_per_query)),
         )
-        query_tile = _aligned_query_tile(max_queries, config.seq_len)
+        query_tile = _query_tile_candidate(max_queries, config.seq_len)
         candidate = (
             reference_batch_shard * query_tile,
             query_tile,
