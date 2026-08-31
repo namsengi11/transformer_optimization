@@ -1,6 +1,6 @@
 # Step 20: admit an inductor-fused variant of the captured graph, behind a gate
 
-- Status: SELECTED
+- Status: DISCARDED (superseded before measurement)
 - Branch: `opt/20-inductor-fused-graph`   (verify unused before `checkout -b`; a second
   session shares this tree and the `opt/NN` convention)
 - Pinned main SHA: `03184a7e1955a0c2b1988a89a5dd4d8b7e2d8b9a`

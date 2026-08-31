@@ -148,6 +148,17 @@ after attributing each run's short-lived 96-98% SM benchmark children to foreign
 with before/after process-tree snapshots so either snapshot can identify an own descendant.
 Require the end-to-end artifact to remain trusted; a live sampler alone is not enough.
 
+## Priority changes preserve abandoned evidence
+
+**Lesson:** Reprioritizing a serial experiment is not a measurement result.
+
+**Evidence:** Step 20 was stopped before measurement when the user selected general
+long-sequence streaming. Its two implementation commits remain isolated on
+`opt/20-inductor-fused-graph` and establish neither a win nor a rejection.
+
+**How to apply:** Close the active record, retain its branch, state that no evidence was
+collected, and give the replacement mechanism a new experiment number.
+
 ## Rejections remain live evidence
 
 **Lesson:** A rejection is scoped to its measured mechanism and can be overturned only by new

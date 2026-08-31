@@ -29,6 +29,7 @@ starting hypothesis or comparison baseline. See `agent/docs/USER_MATRIX.md`.
 | Step | Outcome | Branch | Claim | Default delta | Matrix delta | Evidence |
 |---:|---|---|---|---:|---:|---|
 | 18 | DISCARDED | `opt/18-windows-text-decoding` | Loss-tolerant Windows subprocess decoding keeps GPU provenance alive | not run | not run | `agent/experiments/18-windows-text-decoding/quick.json` (untrusted) |
+| 20 | DISCARDED | `opt/20-inductor-fused-graph` | Admit a whole-core Inductor candidate behind an accuracy gate | not run | not run | superseded before measurement; branch retained |
 
 ## 4. Agent rejection index
 
@@ -66,3 +67,11 @@ fresh descendant snapshot; children that exited between those calls disappeared 
 tree. The verifier therefore returned `REFUTED`, the implementation stayed unmerged, and a
 fresh tooling step must fix both decoding and descendant-attribution races before baseline
 measurement.
+
+### Step 20: Inductor-fused graph
+
+The experiment was superseded before measurement by the user's explicit request to make
+canonical row 14 and other capacity-bound long sequences executable through streaming.
+No latency, MFU, or accuracy claim is made. The implementation remains unmerged on
+`opt/20-inductor-fused-graph`; see
+`agent/experiments/20-inductor-fused-graph/result.md`.
