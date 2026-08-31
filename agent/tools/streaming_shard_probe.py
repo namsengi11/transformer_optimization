@@ -6,6 +6,7 @@ import argparse
 import json
 import statistics
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +54,10 @@ def run(args: argparse.Namespace) -> dict:
     B.copy_model_weights(baseline, model, strict=True)
     del baseline
     model = model.to(device=device, dtype=dtype).eval()
-    x, mask = B.generate_random_case(config, device, dtype, args.seed, 0.0, 1.0)
+    input_device = torch.device("cpu") if args.include_transfers else device
+    x, mask = B.generate_random_case(
+        config, input_device, dtype, args.seed, 0.0, 1.0
+    )
     payload = {
         "provenance": stamp(
             "agent/tools/streaming_shard_probe.py",
@@ -70,26 +74,38 @@ def run(args: argparse.Namespace) -> dict:
             "dtype": args.dtype,
         },
         "target_vram_fraction": args.target_vram_fraction,
+        "includes_host_transfers": args.include_transfers,
         "idle_gate": idle,
         "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
     }
     try:
         with torch.inference_mode():
             for _ in range(args.warmup):
-                model(x, mask)
+                if args.include_transfers:
+                    output = model(x.to(device), mask.to(device)).cpu()
+                    del output
+                else:
+                    model(x, mask)
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
         samples_ms = []
         with torch.inference_mode():
             for _ in range(args.repeats):
-                started = torch.cuda.Event(enable_timing=True)
-                ended = torch.cuda.Event(enable_timing=True)
-                started.record()
-                output = model(x, mask)
-                ended.record()
-                torch.cuda.synchronize(device)
-                samples_ms.append(started.elapsed_time(ended))
+                if args.include_transfers:
+                    torch.cuda.synchronize(device)
+                    started_ns = time.perf_counter_ns()
+                    output = model(x.to(device), mask.to(device)).cpu()
+                    torch.cuda.synchronize(device)
+                    samples_ms.append((time.perf_counter_ns() - started_ns) / 1e6)
+                else:
+                    started = torch.cuda.Event(enable_timing=True)
+                    ended = torch.cuda.Event(enable_timing=True)
+                    started.record()
+                    output = model(x, mask)
+                    ended.record()
+                    torch.cuda.synchronize(device)
+                    samples_ms.append(started.elapsed_time(ended))
                 del output
         peak_allocated = torch.cuda.max_memory_allocated(device)
         peak_reserved = torch.cuda.max_memory_reserved(device)
@@ -128,6 +144,7 @@ def main() -> int:
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="float32")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--include-transfers", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--target-vram-fraction", type=float, default=0.85)
     parser.add_argument("--idle-timeout", type=int, default=900)
