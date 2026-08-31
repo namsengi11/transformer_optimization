@@ -356,7 +356,26 @@ class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))
-        contexts = []
+        # Fixed-capacity workspaces prevent the CUDA allocator from retaining
+        # hundreds of progressively larger causal score/probability blocks.
+        # Only the active [:queries, :keys] view participates in each tile.
+        score_workspace = torch.empty(
+            batch,
+            self.num_heads,
+            self.query_tile_size,
+            seq_len,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        prob_workspace = torch.empty(
+            batch,
+            self.num_heads,
+            self.query_tile_size,
+            seq_len,
+            device=x.device,
+            dtype=torch.float32,
+        )
+        context = torch.empty_like(q)
 
         for start in range(0, seq_len, self.query_tile_size):
             end = min(start + self.query_tile_size, seq_len)
@@ -365,27 +384,36 @@ class QueryTiledBaselineSelfAttention(BaselineSelfAttention):
             # only to overwrite it with -inf. The in-tile upper triangle is
             # still masked below, so full causal semantics are unchanged.
             key_end = end if causal else seq_len
-            scores = (
-                torch.matmul(
-                    q[:, :, start:end],
-                    k[:, :, :key_end].transpose(-2, -1),
-                )
-                * self.scale
+            query_count = end - start
+            scores = score_workspace[:, :, :query_count, :key_end]
+            torch.matmul(
+                q[:, :, start:end],
+                k[:, :, :key_end].transpose(-2, -1),
+                out=scores,
             )
+            scores.mul_(self.scale)
             if causal:
                 query_positions = torch.arange(start, end, device=x.device)[:, None]
                 key_positions = torch.arange(key_end, device=x.device)[None, :]
-                scores = scores.masked_fill(
-                    key_positions > query_positions, float("-inf")
-                )
+                scores.masked_fill_(key_positions > query_positions, float("-inf"))
             if valid_token_mask is not None:
-                scores = scores.masked_fill(
+                scores.masked_fill_(
                     ~valid_token_mask[:, None, None, :key_end], float("-inf")
                 )
-            probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
-            contexts.append(torch.matmul(probs, v[:, :, :key_end]))
+            probs_float = prob_workspace[:, :, :query_count, :key_end]
+            torch.softmax(scores.float(), dim=-1, out=probs_float)
+            if x.dtype == torch.float32:
+                probs = probs_float
+            else:
+                # Scores are dead after softmax, so reuse their fixed storage
+                # for the model-dtype probabilities instead of allocating a
+                # differently sized cast result for every causal tile.
+                scores.copy_(probs_float)
+                probs = scores
+            context[:, :, start:end].copy_(
+                torch.matmul(probs, v[:, :, :key_end])
+            )
 
-        context = torch.cat(contexts, dim=2)
         context = context.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
         output = self.out_proj(context)
         if valid_token_mask is not None:
