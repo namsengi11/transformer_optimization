@@ -26,6 +26,31 @@ workflow lives under `agent/`.
 > supported operations exist, but its kernel choices, gates, capacity policy, and reported
 > speedups are particular to this card and must be re-measured before being claimed elsewhere.
 
+## Inspiration
+
+Explore how far agent-guided, hardware-aware optimization can push transformer inference on
+an accessible RTX 5060 Ti 16 GB.
+
+## What it does
+
+Runs a correctness-preserving transformer forward pass using CUDA graphs, Triton kernels,
+fused operations, and capacity-aware streaming to reduce latency and improve MFU.
+
+## How we built it
+
+We paired PyTorch and Triton with a recursive profile-hypothesize-measure-verify workflow,
+tuning each accepted optimization against eager correctness and compiled-baseline speed.
+
+## Challenges we ran into
+
+Limited VRAM, only 36 SMs, Windows tooling constraints, numerical precision, noisy GPU timing,
+and a sequence-length-100,000 case that cannot use dense attention.
+
+## Accomplishments that we're proud of
+
+All 14 canonical cases are executable, including the streamed extreme case, while preserving
+strict accuracy checks and artifact-backed, reproducible measurements.
+
 ## Hardware used for the reported results
 
 These are the settings of the Windows 11 machine on which the repository was developed and
