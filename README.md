@@ -190,6 +190,21 @@ flag, and latency range, not from a single identical timing value.
 
 ## Agent workflow
 
+### Models used
+
+The agentic development in this repository was driven by two coding agents working against
+the same governed loop:
+
+| Agent | Model |
+|---|---|
+| Claude Code | Claude Opus 5 |
+| Codex | 5.6-sol |
+
+Both operated under the same rules described below: every change is a numbered experiment with
+a falsifiable claim, a stated kill condition, and measurement on the target GPU. Model output
+was never promoted on the strength of the generated code alone -- the accuracy gate and the
+timing protocol decide, and disproven ideas are retained as evidence rather than deleted.
+
 The continuous-improvement agent is introduced in [`agent/README.md`](agent/README.md) and
 governed by [`agent/ORCHESTRATOR.md`](agent/ORCHESTRATOR.md). Its design builds on the earlier
 survey in [`SOTA_AGENT_KERNEL_METHODS.md`](SOTA_AGENT_KERNEL_METHODS.md) and the conclusions in
