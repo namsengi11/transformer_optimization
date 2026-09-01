@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """Reproducible driver for torch_transformer_benchmark.py.
 
-MEASUREMENT PROTOCOL (why each case is run twice)
--------------------------------------------------
+MEASUREMENT PROTOCOL
+--------------------
 torch.compile changes the BASELINE's own fp16/bf16 numerics by more than the
 harness tolerance (measured: bf16 max_abs 0.094, 12% of elements fail; fp16
 max_abs 0.0117). So "eager baseline" and "compiled baseline" are two mutually
 incompatible references -- no implementation can be within tolerance of both.
 
-We therefore split the two things the harness conflates:
+The default report therefore uses one harness run to obtain both requested
+latencies against the same inputs and weights:
 
-  * CORRECTNESS is judged against the EAGER baseline (the harness's default
-    configuration and the true semantic reference)  -> run without
-    --compile-baseline.
-  * SPEED is judged against the COMPILED baseline (the stated bar:
-    torch.compile) -> run with --compile-baseline, and we take only its
-    baseline latency.
+  * BASELINE is the EAGER original implementation (the harness's default
+    configuration and the true semantic reference).
+  * SOTA is the fully optimized user implementation.
 
-speedup = compiled_baseline_median_ms / optimized_median_ms
+When ``--speed-bar`` is requested, a separate compiled-baseline run is added
+for the historical comparison bar. Its output is never used as the numerical
+correctness reference.
 
 MFU (Model FLOPs Utilization)
 ------------------------------
@@ -39,8 +39,16 @@ mantissa -- a known, generation-independent ratio, which is a sanity check
 that these numbers are real). Re-measure with peak_flops.py-style large
 square matmuls if this script ever runs on different hardware.
 
+By default, ``python run_bench.py`` runs the canonical user matrix and reports
+the two requested latency measurements for every shape:
+
+  * baseline: naive eager FP32 ``BaselineTransformer``;
+  * sota: fully optimized ``UserOptimizedTransformer`` workflow.
+
+The historical compiled-baseline speed bar is available with ``--speed-bar``.
+
 Usage:
-    python run_bench.py [--suite default|full|quick|user_matrix] [--tag NAME]
+    python run_bench.py [--suite user_matrix|default|full|quick] [--tag NAME]
 """
 from __future__ import annotations
 
@@ -176,7 +184,8 @@ def preflight_case(extra: list[str]) -> dict | None:
         "gpu_total_memory_bytes": device_bytes,
     }
 
-# name -> extra CLI args. Every case compiles the BASELINE (the bar to beat).
+# name -> extra CLI args. The direct default compares eager baseline with SOTA;
+# --speed-bar optionally adds the historical compiled-baseline measurement.
 SUITES = {
     "quick": {
         "default_fp32": [],
@@ -304,12 +313,19 @@ def run_case(name: str, extra: list[str], compile_baseline: bool,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", default="default", choices=sorted(SUITES))
+    ap.add_argument("--suite", default="user_matrix", choices=sorted(SUITES),
+                    help="shape suite (default: canonical user_matrix)")
     ap.add_argument("--tag", default=None, help="label for the results file")
     ap.add_argument("--compile-user", action="store_true",
                     help="also wrap the user model in torch.compile externally")
-    ap.add_argument("--skip-speed-bar", action="store_true",
-                    help="skip the compiled-baseline run (correctness only)")
+    speed_bar_group = ap.add_mutually_exclusive_group()
+    speed_bar_group.add_argument(
+        "--speed-bar", action="store_true",
+        help="also measure the historical compiled-baseline comparison bar",
+    )
+    speed_bar_group.add_argument(
+        "--skip-speed-bar", action="store_true", help=argparse.SUPPRESS,
+    )
     ap.add_argument("--bar-reps", type=int, default=2,
                     help="runs of the compiled baseline; the fastest is used "
                          "as the bar (conservative)")
@@ -321,8 +337,8 @@ def main() -> int:
                          "(default suite only; `full` already includes them)")
     ap.add_argument("--show-bar", action="store_true",
                     help="also report the compiled-baseline speed bar columns; "
-                         "the bar is always measured and always written to the "
-                         "JSON, this only controls the printed table")
+                         "requires --speed-bar (the measurement is always "
+                         "written to JSON when enabled)")
     args = ap.parse_args()
 
     cases = dict(SUITES[args.suite])
@@ -353,7 +369,7 @@ def main() -> int:
         )
 
         bar = None
-        if not args.skip_speed_bar and not streaming:
+        if args.speed_bar and not args.skip_speed_bar and not streaming:
             # The compiled baseline has ~30% run-to-run variance across processes
             # (observed: padded_fp16 bar 2.03 ms vs 1.53 ms on identical code).
             # Take the FASTEST bar over `--bar-reps` runs, which is the
@@ -386,6 +402,10 @@ def main() -> int:
             "eager_baseline_ms": acc_run.get("baseline_ms"),
             "compiled_baseline_ms": bar,
             "optimized_ms": opt_ms,
+            # Clear public name for the fully optimized workflow. Keep
+            # optimized_ms as a compatibility key for agent tooling and old
+            # result consumers.
+            "sota_ms": opt_ms,
             "speedup_vs_compiled": (bar / opt_ms) if (bar and opt_ms) else None,
             "speedup_vs_eager": ((acc_run.get("baseline_ms") or 0) / opt_ms)
                                  if opt_ms else None,
@@ -408,7 +428,7 @@ def main() -> int:
         # how close each side runs to its own ceiling.
         r["latency_gain_vs_eager"] = r["speedup_vs_eager"]
         results.append(r)
-        print(f"[run_bench]   acc={r['accuracy']} opt={opt_ms}ms "
+        print(f"[run_bench]   acc={r['accuracy']} sota={opt_ms}ms "
               f"eager_base={r['eager_baseline_ms']}ms compiled_base={bar}ms "
               f"speedup_vs_compiled={r['speedup_vs_compiled']} "
               f"mfu_optimized={r['mfu_optimized']}", flush=True)
@@ -431,14 +451,17 @@ def main() -> int:
 
     cols = [("#", 5), ("B", 7), ("S", 6), ("d", 6), ("H", 4), ("L", 4),
             ("ffn", 6), ("accuracy", 9), ("max_abs", 10),
-            ("baseline", 12), ("optimized", 12), ("speedup", 9)]
+            ("baseline", 12), ("sota", 12), ("speedup", 9), ("mfu", 8)]
     if args.show_bar:
         cols += [("compiled", 12), ("vs_comp", 9)]
     hdr = " ".join(f"{h:>{w}}" for h, w in cols)
     print(chr(10) + "=" * len(hdr))
     print(f"SUITE={args.suite}  TAG={tag}")
-    print("baseline = naive eager reference | optimized = shipped model")
-    if not args.show_bar:
+    print("baseline = naive eager original (query-tiled equivalent if required) | "
+          "sota = fully optimized workflow")
+    if not args.speed_bar:
+        print("compiled-baseline bar not measured; --speed-bar to include it")
+    elif not args.show_bar:
         print("compiled-baseline bar measured and stored in the JSON; "
               "--show-bar to print it")
     print("=" * len(hdr))
@@ -454,9 +477,11 @@ def main() -> int:
             ma = str(r["max_abs"])
         vals = [row_label(r["name"], i), s["batch_size"], s["seq_len"],
                 s["d_model"], s["heads"], s["layers"], s["ffn_dim"], acc, ma,
-                fmt_ms(r["eager_baseline_ms"]), fmt_ms(r["optimized_ms"]),
+                fmt_ms(r["eager_baseline_ms"]), fmt_ms(r["sota_ms"]),
                 (f"{r['latency_gain_vs_eager']:.2f}x"
-                 if r["latency_gain_vs_eager"] else "--")]
+                 if r["latency_gain_vs_eager"] else "--"),
+                (f"{100*r['mfu_optimized']:.2f}%"
+                 if r["mfu_optimized"] else "--")]
         if args.show_bar:
             vals += [fmt_ms(r["compiled_baseline_ms"]),
                      (f"{r['speedup_vs_compiled']:.2f}x"
@@ -499,8 +524,8 @@ def main() -> int:
     if n_streamed:
         print(f"streaming: {n_streamed}/{len(results)} cases used capacity streaming")
 
-    outdir = Path("results")
-    outdir.mkdir(exist_ok=True)
+    outdir = SCRIPT.parent / "agent" / "results"
+    outdir.mkdir(parents=True, exist_ok=True)
     path = outdir / f"{tag.replace('/', '_')}_{args.suite}.json"
     path.write_text(json.dumps(results, indent=2))
     print(f"{chr(10)}wrote {path}")
