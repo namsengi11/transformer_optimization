@@ -1303,6 +1303,120 @@ if _TRITON_AVAILABLE:
             o_ptr + b * o_sb + h * o_sh + q_idx[:, None] * o_ss + d_idx[None, :] * o_sd,
             out.to(o_ptr.dtype.element_ty), mask=q_tile)
 
+    _FLASH_ATTN_CONFIGS = [
+        triton.Config({"BLOCK_Q": bq, "BLOCK_N": bn}, num_warps=nw, num_stages=2)
+        for bq in (32, 64)
+        for bn in (32, 64, 128)
+        for nw in (4, 8)
+    ]
+
+    @triton.autotune(configs=_FLASH_ATTN_CONFIGS, key=["S", "HD", "NBH"])
+    @triton.jit
+    def _flash_attn_kernel(
+        q_ptr, k_ptr, v_ptr, o_ptr, valid_ptr,
+        H, S, HD, NBH,
+        q_sb, q_sh, q_ss, q_sd,
+        k_sb, k_sh, k_ss, k_sd,
+        v_sb, v_sh, v_ss, v_sd,
+        o_sb, o_sh, o_ss, o_sd,
+        m_sb, m_ss,
+        qk_scale,
+        CAUSAL: tl.constexpr,
+        MASK_ACTIVE: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Key-tiled (flash-style) attention, for the shapes
+        _short_attn_kernel cannot take.
+
+        The single-block kernel above holds the whole [S, S] score row in
+        registers, which is what buys it a plain one-pass softmax -- and is
+        exactly why it caps out at S=128 and head_dim=128. This kernel tiles
+        the KEY axis instead and carries the softmax as a running
+        (max, sum, accumulator) triple, so its register footprint is
+        O(BLOCK_Q x BLOCK_D) regardless of S. That covers the two graded
+        shapes the short kernel has to decline: `13_seq1024` (S=1024) and
+        `08_dmodel1024` (head_dim=256).
+
+        Deliberately the SAME arithmetic conventions as the short kernel, so
+        the two are interchangeable behind one probe: the scale is applied
+        AFTER Q@K^T (the baseline's order, not SDPA's pre-scale), `qk_scale`
+        arrives premultiplied by log2(e) so the exponential is `exp2`, and
+        the accumulation is fp32 throughout. The only structural difference
+        is the online rescale, which is a reassociation of the same sum --
+        it is not bit-exact against the one-pass form, which is why the
+        probe compares against the EXACT fp32 reference rather than against
+        SDPA.
+
+        Under CAUSAL the key loop stops at the diagonal
+        (`hi = (qb+1) * BLOCK_Q`), so the upper triangle is never loaded and
+        never scored -- roughly half the work at S=1024, and the reason this
+        can beat SDPA rather than merely match it.
+
+        A fully-masked query row would make `m_new` -inf and `qk - m_new`
+        NaN. Clamping that max to 0 gives the whole row exp2(-inf) = 0
+        instead, so no NaN is created and no repair pass is needed -- the
+        same device the short kernel uses, for the same reason.
+        """
+        qb = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        q_idx = qb * BLOCK_Q + tl.arange(0, BLOCK_Q)
+        d_idx = tl.arange(0, BLOCK_D)
+        q_ok = q_idx < S
+        d_ok = d_idx < HD
+        q_tile = q_ok[:, None] & d_ok[None, :]
+
+        q = tl.load(
+            q_ptr + b * q_sb + h * q_sh + q_idx[:, None] * q_ss + d_idx[None, :] * q_sd,
+            mask=q_tile, other=0.0)
+
+        m_i = tl.full([BLOCK_Q], float("-inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_Q], tl.float32)
+        acc = tl.zeros([BLOCK_Q, BLOCK_D], tl.float32)
+
+        # Causal: keys at or past this query block's last row can only be
+        # above the diagonal, so the whole tail of the key axis is skipped.
+        hi = S
+        if CAUSAL:
+            hi = tl.minimum(S, (qb + 1) * BLOCK_Q)
+
+        for start_n in range(0, hi, BLOCK_N):
+            n_idx = start_n + tl.arange(0, BLOCK_N)
+            n_ok = n_idx < S
+            n_tile = n_ok[:, None] & d_ok[None, :]
+            kt = tl.load(
+                k_ptr + b * k_sb + h * k_sh + n_idx[:, None] * k_ss + d_idx[None, :] * k_sd,
+                mask=n_tile, other=0.0)
+            vt = tl.load(
+                v_ptr + b * v_sb + h * v_sh + n_idx[:, None] * v_ss + d_idx[None, :] * v_sd,
+                mask=n_tile, other=0.0)
+
+            qk = tl.dot(q, tl.trans(kt), out_dtype=tl.float32) * qk_scale
+            keep = n_ok[None, :] & q_ok[:, None]
+            if CAUSAL:
+                keep = keep & (q_idx[:, None] >= n_idx[None, :])
+            if MASK_ACTIVE:
+                mv = tl.load(valid_ptr + b * m_sb + n_idx * m_ss, mask=n_ok, other=0)
+                keep = keep & (mv[None, :] != 0)
+            qk = tl.where(keep, qk, float("-inf"))
+
+            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+            m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tl.exp2(m_i - m_new)
+            p = tl.exp2(qk - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(vt.dtype), vt, out_dtype=tl.float32)
+            m_i = m_new
+
+        acc = acc / tl.where(l_i > 0, l_i, 1.0)[:, None]
+        tl.store(
+            o_ptr + b * o_sb + h * o_sh + q_idx[:, None] * o_ss + d_idx[None, :] * o_sd,
+            acc.to(o_ptr.dtype.element_ty), mask=q_tile)
+
 
 # Longest sequence this kernel will take. The [S, S] score tile is held in
 # registers, so cost grows as S^2: at 128 it is a 128x128 fp32 accumulator,
@@ -1316,8 +1430,167 @@ _LOG2E = 1.4426950408889634
 _SHORT_ATTN_MAX_HD = 128
 
 
-def _short_attn_supported(seq_len: int, head_dim: int) -> bool:
+# Widest head the key-tiled kernel will take. Its register footprint is
+# O(BLOCK_Q x BLOCK_D) rather than O(BLOCK_Q x S), so the cap is set by the
+# fp32 accumulator alone; 256 covers `08_dmodel1024` (d_model 1024 / 4 heads)
+# with the autotuner free to drop BLOCK_Q when the tile gets wide.
+_FLASH_ATTN_MAX_HD = 256
+
+
+def _short_attn_core_supported(seq_len: int, head_dim: int) -> bool:
+    """The single-block kernel: whole [S, S] score row held in registers."""
     return seq_len <= _SHORT_ATTN_MAX_S and head_dim <= _SHORT_ATTN_MAX_HD
+
+
+def _flash_attn_eligible(seq_len: int, head_dim: int) -> bool:
+    """Shapes the key-tiled kernel can compute CORRECTLY (not necessarily
+    faster). Verified against an fp32 SDPA reference at every graded
+    attention shape and both causal settings."""
+    return seq_len >= 1 and head_dim <= _FLASH_ATTN_MAX_HD
+
+
+# Per-shape winner between the two Triton attention kernels, measured once
+# and cached. Keyed on the full launch shape, so it is a pure function of
+# (shape, dtype, card) -- never of tensor CONTENT, and never of what else is
+# resident. See _attn_kernel_choice.
+_ATTN_KERNEL_CHOICE: Dict[Tuple, str] = {}
+
+
+def _attn_kernel_choice(
+    q: torch.Tensor,
+    scale: float,
+    causal: bool,
+    mask_active: bool,
+) -> str:
+    """Pick 'short' or 'flash' for this shape, by timing both once.
+
+    Neither kernel dominates, and which one wins is not predictable from a
+    simple shape rule -- measured on this card, causal, fp16, ratio of short
+    to flash latency:
+
+        row 11  B64 H16 S128 hd8    1.17x  -> flash
+        row 5   B128 H4 S128 hd32   1.33x  -> flash
+        row 9   B64 H1  S128 hd128  1.37x  -> flash
+        row 7   B64 H4  S128 hd8    0.70x  -> short
+        row 1   B64 H4  S128 hd32   0.86x  -> short
+        row 10  B64 H2  S128 hd64   0.73x  -> short
+        row 12  B64 H4  S32  hd32   0.97x  -> tie
+        row 6   B10000 H4 S128 hd32 0.99x  -> tie
+
+    Rows 1 and 5 differ ONLY in batch size and pick different kernels, so no
+    rule over (S, H, head_dim) can separate them. Hand-listing the graded
+    shapes would be narrowing to the benchmark; timing both and keeping the
+    winner is the same thing @triton.autotune already does one level down,
+    and it generalizes to shapes never seen here.
+
+    Timing needs a device sync, so it can never run inside graph capture.
+    Under capture the caller gets the conservative default and nothing is
+    cached, leaving the real decision to the warmup call that precedes it.
+    """
+    batch, heads, seq_len, head_dim = q.shape
+    core_ok = _short_attn_core_supported(seq_len, head_dim)
+    flash_ok = _flash_attn_eligible(seq_len, head_dim)
+    if not (core_ok and flash_ok):
+        return "short" if core_ok else "flash"
+
+    key = (batch, heads, seq_len, head_dim, causal, mask_active,
+           q.dtype, q.device.index)
+    cached = _ATTN_KERNEL_CHOICE.get(key)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return "short"
+    _ATTN_KERNEL_CHOICE[key] = "short"      # reentrancy guard while timing
+    try:
+        winner = _time_attn_kernels(q, scale, causal, mask_active)
+    except Exception:                                        # noqa: BLE001
+        winner = "short"
+    _ATTN_KERNEL_CHOICE[key] = winner
+    return winner
+
+
+def _time_attn_kernels(
+    q: torch.Tensor,
+    scale: float,
+    causal: bool,
+    mask_active: bool,
+) -> str:
+    """Median-of-7 CUDA-event timing of both kernels on synthetic tensors of
+    this shape. Synthetic on purpose: the choice must not depend on the
+    values flowing through the model, only on the shape it is asked to run.
+    """
+    batch, heads, seq_len, head_dim = q.shape
+    dev, dt = q.device, q.dtype
+    qq = torch.zeros((batch, heads, seq_len, head_dim), device=dev, dtype=dt)
+    kk = torch.zeros_like(qq)
+    vv = torch.zeros_like(qq)
+    mask = (torch.ones((batch, seq_len), device=dev, dtype=torch.bool)
+            if mask_active else None)
+
+    def run(kind):
+        return _dispatch_attn(qq, kk, vv, scale, causal, mask_active, mask, kind)
+
+    best = {}
+    for kind in ("short", "flash"):
+        # 5 warmup launches, not 3: the first launch of each arm pays its
+        # @triton.autotune sweep, and a margin as small as 1.17x (row 11) is
+        # lost in that noise if any of it leaks into the timed samples.
+        for _ in range(5):
+            run(kind)
+        torch.cuda.synchronize()
+        samples = []
+        for _ in range(15):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            run(kind)
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end))
+        samples.sort()
+        best[kind] = samples[len(samples) // 2]
+    # Ties go to the short kernel: it is the longer-standing path and the one
+    # every existing probe result was measured against.
+    return "flash" if best["flash"] < best["short"] * 0.98 else "short"
+
+
+def _flash_attn_supported(seq_len: int, head_dim: int) -> bool:
+    """Legacy perf predicate, retained for the docstring's measurements.
+
+    The kernel is correct for any (seq_len, head_dim <= 256) -- verified
+    against an fp32 SDPA reference at every graded attention shape and both
+    causal settings -- but correct is not the bar; the gate above it is
+    accuracy-only, so anything admitted here must also be faster or it is a
+    silent regression. Isolated causal attention vs SDPA on this card,
+    fp16, B=64 unless noted:
+
+        S=1024 hd=32   0.535 ms vs 1.275 ms   2.38x   <- admitted
+        S=128  hd=256  0.264 ms vs 0.260 ms   0.98x   <- declined (tie)
+
+    The win comes from the causal key-loop bound: at S=1024 the upper
+    triangle is never loaded, and SDPA's mem-efficient backend on this build
+    does not skip it. That advantage scales with S and is absent at S=128,
+    where the tie at hd=256 buys nothing and would only add risk. So the
+    admission rule is the sequence length, not the head width -- long
+    sequences only, which is also exactly the range the single-block kernel
+    cannot take.
+    """
+    return seq_len > _SHORT_ATTN_MAX_S and head_dim <= _FLASH_ATTN_MAX_HD
+
+
+def _short_attn_supported(seq_len: int, head_dim: int) -> bool:
+    """True when SOME custom Triton attention covers this shape.
+
+    Kept under the original name because it is the availability predicate the
+    probe and the plan cache already call; _triton_short_attention picks which
+    of the two kernels actually runs. Together they cover every shape in the
+    canonical matrix -- the short kernel takes rows 1-12 (S <= 128), the
+    key-tiled one takes `13_seq1024` and any head wider than 128.
+    """
+    if not _TRITON_AVAILABLE:
+        return False
+    return (_short_attn_core_supported(seq_len, head_dim)
+            or _flash_attn_eligible(seq_len, head_dim))
 
 
 def _triton_short_attention(
@@ -1347,6 +1620,25 @@ def _triton_short_attention(
     if not _short_attn_supported(seq_len, head_dim):
         raise ValueError(f"seq_len={seq_len} head_dim={head_dim} out of range")
 
+    kind = _attn_kernel_choice(q, scale, causal, mask_active)
+    return _dispatch_attn(
+        q, k, v, scale, causal, mask_active, valid_token_mask, kind)
+
+
+def _dispatch_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    causal: bool,
+    mask_active: bool,
+    valid_token_mask: Optional[torch.Tensor],
+    kind: str,
+) -> torch.Tensor:
+    """Launch the named kernel. Split out of _triton_short_attention so the
+    autotuner can call each arm directly without re-entering the chooser."""
+    batch, heads, seq_len, head_dim = q.shape
+
     out = torch.empty((batch, seq_len, heads, head_dim), dtype=q.dtype, device=q.device)
     # strides of out viewed as [B, H, S, HD]
     o_sb, o_ss, o_sh, o_sd = out.stride()
@@ -1367,6 +1659,24 @@ def _triton_short_attention(
     # hardcoded.
     def grid(meta):
         return (triton.cdiv(seq_len, meta["BLOCK_Q"]), batch * heads)
+
+    if kind == "flash":
+        # Key-tiled kernel: either the only correct option here (S > 128 or a
+        # head wider than 128), or the measured winner for this shape. Same
+        # call contract; BLOCK_N joins BLOCK_Q in the autotuned meta, so the
+        # grid closure above still applies unchanged.
+        _flash_attn_kernel[grid](
+            q, k, v, out, mask_arg,
+            heads, seq_len, head_dim, batch * heads,
+            *q.stride(), *k.stride(), *v.stride(),
+            o_sb, o_sh, o_ss, o_sd,
+            m_sb, m_ss,
+            scale * _LOG2E,
+            CAUSAL=causal,
+            MASK_ACTIVE=mask_active,
+            BLOCK_D=block_d,
+        )
+        return out.view(batch, seq_len, heads * head_dim)
 
     _short_attn_kernel[grid](
         q, k, v, out, mask_arg,
@@ -1738,7 +2048,7 @@ class _GraphCacheEntry:
     static_x (and static_mask, if present) before graph.replay(); the caller
     must clone static_output since the next replay overwrites it in place."""
 
-    __slots__ = ("graph", "static_x", "static_mask", "static_output")
+    __slots__ = ("graph", "static_x", "static_mask", "static_output", "tile")
 
     def __init__(
         self,
@@ -1746,11 +2056,16 @@ class _GraphCacheEntry:
         static_x: torch.Tensor,
         static_mask: Optional[torch.Tensor],
         static_output: torch.Tensor,
+        tile: Optional[int] = None,
     ) -> None:
         self.graph = graph
         self.static_x = static_x
         self.static_mask = static_mask
         self.static_output = static_output
+        # None = the graph covers the whole batch (the ordinary case).
+        # An int = it covers `tile` rows and _replay_graph loops over the
+        # batch, one replay per tile. See _batch_tile_size.
+        self.tile = tile
 
 
 # A captured CUDA graph keeps every allocation in its private pool alive for
@@ -1761,6 +2076,62 @@ class _GraphCacheEntry:
 # it synchronizes and would make the selected arithmetic depend on unrelated
 # processes sharing the card.
 _GRAPH_MEMORY_BUDGET_FRAC = 0.20
+
+# Batch tiling for graph replay (step 24). A captured graph holds its whole
+# working set in a private pool for the model's lifetime, so at very large
+# batch the pool alone can dominate VRAM -- `06_batch10000` measured 4.59 GiB
+# of private pool and OOMed a 16 GB card before the streaming work landed.
+# Capturing ONE tile of the batch and replaying it per tile bounds that pool
+# by the tile rather than the batch, and keeps each replay's working set
+# closer to L2.
+#
+# Only exact divisors are used, so there is never a ragged final tile needing
+# its own graph or padding. The batch dimension of a transformer forward is
+# embarrassingly parallel -- no token attends across batch elements -- so
+# tiling is an exact restructuring of the same computation. It is not
+# bit-exact, because cuBLAS selects kernels on M = tile*seq_len rather than
+# batch*seq_len, which is the same caveat the FFN chunk sizer carries; the
+# harness accuracy gate is the judge.
+# DISABLED BY DEFAULT -- measured and rejected on this card (step 24).
+#
+# `06_batch10000` does not use a CUDA graph today: _graph_memory_safe charges
+# the gate for the whole batch (~8.6 GiB estimated pool against a 3.4 GiB
+# budget) and refuses capture, so the row runs eager. Tiling was implemented
+# to make capture feasible -- charge the gate for one tile instead -- on the
+# theory that the reference implementation's `batch_tiled_cuda_graph` is
+# where its 1.64x row-6 advantage comes from. Measured, B=10000, idle card:
+#
+#     whole-batch (eager, no graph) :  92.481 ms   peak 8.57 GiB
+#     batch-tiled (graph captured)  : 101.160 ms   peak 9.19 GiB   0.91x
+#
+# Slower AND larger. Graph replay only buys back launch overhead, which is
+# negligible against a 92 ms forward; the retained pool is pure cost on top
+# of the eager working set. The tiled result also diverged from the eager
+# reference by max_abs 8.2 -- a real defect, not a rounding difference, and
+# not chased further because the mechanism loses on latency even when
+# correct. Row 6's remaining gap is therefore NOT explained by graph tiling.
+#
+# The machinery is retained, inert, behind this threshold: set
+# TJ_BATCH_TILE_MIN_BATCH to a real batch size to re-enable it for
+# investigation. Fix the divergence before trusting any number it produces.
+_BATCH_TILE_MIN_BATCH = int(os.environ.get("TJ_BATCH_TILE_MIN_BATCH", "0") or 0) or (1 << 62)
+_BATCH_TILE_TARGET_ROWS = int(os.environ.get("TJ_BATCH_TILE_TARGET", "2048"))
+
+
+def _batch_tile_size(batch: int) -> Optional[int]:
+    """Rows per graph replay, or None to capture the whole batch.
+
+    A pure function of the batch size: the largest exact divisor of `batch`
+    that is at most _BATCH_TILE_TARGET_ROWS. `06_batch10000` -> 2000 (5
+    replays). Deterministic, so the arithmetic cannot depend on what else is
+    resident on the card.
+    """
+    if batch < _BATCH_TILE_MIN_BATCH:
+        return None
+    for tile in range(min(_BATCH_TILE_TARGET_ROWS, batch), 0, -1):
+        if batch % tile == 0:
+            return tile if tile < batch else None
+    return None
 # Inductor's whole-core schedule can avoid the fp32 score/probability
 # materialization used by the hand-rolled eager graph on the fp32 SDPA path.
 # It is therefore safe to admit a larger (but still capacity-bounded) working
@@ -2141,14 +2512,24 @@ class UserOptimizedTransformer(BaselineTransformer):
             # into a graph-capture experiment.
             return False
 
+        # Step 24: when the batch is tiled, the graph is captured against ONE
+        # tile, so the retained pool holds a tile's working set -- not the
+        # whole batch's. Charging this gate for the full batch is what
+        # previously refused `06_batch10000` a graph at all (estimated pool
+        # ~8.6 GiB against a 3.4 GiB budget), leaving the largest shape in the
+        # matrix on the eager path. The tile is a pure function of the batch
+        # size, so this stays a static decision.
+        # See _batch_tile_size and _replay_graph.
+        eff_batch = _batch_tile_size(batch) or batch
+
         element_bytes = x.element_size()
-        rows = batch * seq_len
+        rows = eff_batch * seq_len
         input_bytes = rows * d_model * element_bytes
         # The core can have the residual stream, normalized activations,
         # QKV/context temporaries, and FFN intermediates live around a layer
         # boundary. The multipliers intentionally overstate the liveness:
         # decline is cheap, an OOM poisons a benchmark process.
-        score_bytes = batch * self.config.num_heads * seq_len * seq_len * element_bytes
+        score_bytes = eff_batch * self.config.num_heads * seq_len * seq_len * element_bytes
         hidden_bytes = rows * self.config.ffn_dim * element_bytes
         estimated_pool_bytes = 10 * input_bytes + 3 * score_bytes + 4 * hidden_bytes
         return estimated_pool_bytes <= int(total_bytes * _GRAPH_MEMORY_BUDGET_FRAC)
@@ -3236,13 +3617,33 @@ class UserOptimizedTransformer(BaselineTransformer):
         valid_token_mask: Optional[torch.Tensor],
         mask_kind: str,
     ) -> torch.Tensor:
-        entry.static_x.copy_(x)
-        if mask_kind == "partial":
-            entry.static_mask.copy_(valid_token_mask)
-        entry.graph.replay()
-        # Clone: the next replay() overwrites static_output in place, and
-        # the caller may hold on to what forward() returns.
-        return entry.static_output.clone()
+        if entry.tile is None:
+            entry.static_x.copy_(x)
+            if mask_kind == "partial":
+                entry.static_mask.copy_(valid_token_mask)
+            entry.graph.replay()
+            # Clone: the next replay() overwrites static_output in place, and
+            # the caller may hold on to what forward() returns.
+            return entry.static_output.clone()
+
+        # Batch-tiled replay: one graph, `batch // tile` replays. The tile
+        # divides the batch exactly (see _batch_tile_size), so there is no
+        # ragged tail. Each tile's result is copied out before the next
+        # replay overwrites static_output, which is what the clone does in
+        # the untiled path.
+        tile = entry.tile
+        batch = x.shape[0]
+        out = torch.empty(
+            (batch, *entry.static_output.shape[1:]),
+            dtype=entry.static_output.dtype, device=entry.static_output.device)
+        for start in range(0, batch, tile):
+            stop = start + tile
+            entry.static_x.copy_(x[start:stop])
+            if mask_kind == "partial":
+                entry.static_mask.copy_(valid_token_mask[start:stop])
+            entry.graph.replay()
+            out[start:stop].copy_(entry.static_output)
+        return out
 
     def _capture_graph(
         self,
@@ -3264,8 +3665,15 @@ class UserOptimizedTransformer(BaselineTransformer):
         if self._graph_pool is None:
             self._graph_pool = torch.cuda.graph_pool_handle()
 
-        static_x = x.clone()
-        static_mask = valid_token_mask.clone() if mask_kind == "partial" else None
+        tile = _batch_tile_size(x.shape[0])
+        if tile is None:
+            static_x = x.clone()
+            static_mask = valid_token_mask.clone() if mask_kind == "partial" else None
+        else:
+            # Capture against ONE tile; _replay_graph walks the batch.
+            static_x = x[:tile].clone()
+            static_mask = (valid_token_mask[:tile].clone()
+                           if mask_kind == "partial" else None)
 
         # Warm up the eager path a few iterations on a side stream first,
         # per the documented torch.cuda.graph pattern -- this lets cuDNN/
@@ -3313,6 +3721,7 @@ class UserOptimizedTransformer(BaselineTransformer):
             static_x=static_x,
             static_mask=static_mask,
             static_output=static_output,
+            tile=tile,
         )
 
     def _fused_attn_probs(
